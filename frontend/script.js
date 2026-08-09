@@ -20,7 +20,7 @@
    For local development against `uvicorn main:app --port 7860`, use:
        const API_BASE_URL = "http://127.0.0.1:7860";
    ------------------------------------------------------------------------- */
-const API_BASE_URL = "YOUR_BACKEND_URL";
+const API_BASE_URL = "https://saveflow-ten.vercel.app/";
 
 // ---- Element handles -------------------------------------------------------
 const form = document.getElementById("downloadForm");
