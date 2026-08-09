@@ -66,34 +66,44 @@ docker run --rm -p 7860:7860 saveflow-api
 
 ## 2. Deploy the backend
 
-The backend needs a host that runs a container — `yt-dlp` and `ffmpeg` cannot run on a static host. Hugging Face **Docker Spaces now require a paid plan**, so the free route is elsewhere.
+The backend runs Python, so it cannot live on a static host. `backend/` deploys two ways with no code changes: serverless (Vercel detects `main.py` directly) or as a container (`backend/Dockerfile`).
 
-The `Dockerfile` reads the port from the `PORT` environment variable and falls back to `7860`, so the same image runs unchanged on every host below.
+**Why no `ffmpeg` is needed:** the API sets `skip_download: True` and never merges streams. It reads metadata and returns the platform's own CDN URLs; the media itself never passes through the server. `ffmpeg` only matters when yt-dlp has to mux or transcode, which this app never does. It stays in the `Dockerfile` so the image also works for anyone who later adds server-side downloading.
 
 | Host | Free? | Card needed | Sleeps when idle | Notes |
 | --- | --- | --- | --- | --- |
-| **Render** | Yes, 750 h/month | No | Yes, after ~15 min | Easiest. Reads the `Dockerfile` directly. |
-| **Google Cloud Run** | Yes, 2M requests/month | Yes | Scales to zero | Fastest cold starts, but billing must be enabled. |
-| **Koyeb** | One free service | Sometimes | No | Good middle ground. |
-| **Oracle Cloud** | Always Free ARM VM | Yes | No | Most generous, but you administer the VM yourself. |
-| **Hugging Face** | Docker requires PRO | — | Yes | Only worth it if you already pay for PRO. |
+| **Vercel** | Hobby, forever | **No** | Scales to zero | Deploys `backend/` directly. Hobby is personal, non-commercial use only. |
+| **Render** | 750 h/month | Often yes now | Yes, after ~15 min | Uses the `Dockerfile`. Asks new accounts to verify a card. |
+| **Google Cloud Run** | 2M requests/month | Yes | Scales to zero | Fastest cold starts, billing must be enabled. |
+| **Koyeb** | One free instance | Sometimes | After 1 h | Free tier availability changed post-acquisition. |
+| **Hugging Face** | Docker needs PRO | — | Yes | Only worth it if you already pay for PRO. |
 
-Plan terms change often — check the host's current pricing page before committing.
+Free-tier terms change often — check the host's current pricing page before committing.
 
-### 2a. Render (recommended)
+### 2a. Vercel (recommended — no credit card)
 
 1. Push this repository to GitHub (see step 3b if you have not yet).
-2. Go to <https://dashboard.render.com/> → **New** → **Web Service**, and connect the repository.
-3. Configure:
-   - **Language / Runtime**: `Docker`
-   - **Root Directory**: `backend`
-   - **Instance Type**: `Free`
-4. Click **Deploy**. The first build takes a few minutes because `ffmpeg` is installed into the image.
-5. Your API goes live at `https://<service-name>.onrender.com` — open it and you should see the healthcheck JSON.
+2. Go to <https://vercel.com/new> and import the repository.
+3. Expand **Root Directory**, click **Edit**, and select **`backend`**. This is the only setting you need to change.
+4. Click **Deploy**.
+5. Your API goes live at `https://<project-name>.vercel.app` — open it and you should see the healthcheck JSON.
 
-Render injects `PORT` automatically; do not set it yourself.
+No `vercel.json` and no adapter file are involved. Vercel's Python runtime looks for an entrypoint named `app.py`, `index.py`, `server.py`, `main.py`, `wsgi.py` or `asgi.py` that defines a top-level `app`, and `backend/main.py` matches once `backend` is the root. It installs from `backend/requirements.txt` and routes every request into FastAPI, so `/` and `/api/extract` both work.
 
-### 2b. Google Cloud Run
+Detection is static — Vercel reads the file rather than importing it, so the entrypoint must contain a literal `app = FastAPI(...)`. A module that re-exports the app with `from … import app` will not be recognised.
+
+Vercel's Hobby plan is for personal, non-commercial projects. Read their terms if this ever becomes something you charge for.
+
+### 2b. Render (container)
+
+1. Push the repository to GitHub.
+2. <https://dashboard.render.com/> → **New** → **Web Service**, connect the repository.
+3. Configure — **Language** `Docker`, **Root Directory** `backend`, **Instance Type** `Free`.
+4. Deploy. The first build takes a few minutes because `ffmpeg` goes into the image.
+
+Render injects `PORT` automatically; do not set it yourself. New accounts are increasingly asked to verify a credit card before the free instance type unlocks.
+
+### 2c. Google Cloud Run
 
 With the [gcloud CLI](https://cloud.google.com/sdk/docs/install) installed and a project selected:
 
@@ -103,7 +113,7 @@ gcloud run deploy saveflow-api --source ./backend --region asia-southeast2 --all
 
 Cloud Run builds the `Dockerfile`, injects `PORT=8080` and prints the live URL when it finishes. Raise `--memory` if extraction of large videos gets killed.
 
-### 2c. Hugging Face Spaces (needs a PRO plan)
+### 2d. Hugging Face Spaces (needs a PRO plan)
 
 1. Go to <https://huggingface.co/new-space>, pick SDK **Docker** → **Blank**, visibility **Public**.
 2. Clone the empty Space:
@@ -140,7 +150,7 @@ Spaces expose port `7860` only — the image already defaults to it, so no confi
 Open [frontend/script.js](frontend/script.js) and edit the constant at the top — no trailing slash:
 
 ```js
-const API_BASE_URL = "https://saveflow-api.onrender.com";
+const API_BASE_URL = "https://saveflow-api.vercel.app";
 ```
 
 Test locally before deploying:

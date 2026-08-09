@@ -16,8 +16,11 @@ env/
 Thumbs.db
 desktop.ini
 
-# Local tooling (preview server config for Claude Code)
+# Local tooling
 .claude/
+
+# Vercel CLI link data
+.vercel/
 
 # Design reference only — not part of the app, ~3 MB of template vendor files.
 # Delete this line if you want the reference committed.

@@ -8,13 +8,14 @@
    Point this at your deployed backend, WITHOUT a trailing slash.
 
    URL shape depends on where you deployed it:
+       Vercel        https://<project-name>.vercel.app
        Render        https://<service-name>.onrender.com
        Cloud Run     https://<service>-<hash>-<region>.a.run.app
        Koyeb         https://<service>-<org>.koyeb.app
        Hugging Face  https://<username>-<space-name>.hf.space
 
    Example:
-       const API_BASE_URL = "https://saveflow-api.onrender.com";
+       const API_BASE_URL = "https://saveflow-api.vercel.app";
 
    For local development against `uvicorn main:app --port 7860`, use:
        const API_BASE_URL = "http://127.0.0.1:7860";
