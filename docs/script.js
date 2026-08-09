@@ -122,7 +122,7 @@ errorClose.addEventListener("click", clearError);
 // ---- Rendering -------------------------------------------------------------
 
 /** Build one result card. `index` is only used to label carousel slides. */
-function renderCard(item, platform, index, total) {
+function renderCard(item, platform, index, total, sourceUrl) {
   const card = document.createElement("article");
   card.className = "result-card";
 
@@ -140,11 +140,18 @@ function renderCard(item, platform, index, total) {
   const formats = item.formats
     .map((fmt, i) => {
       const size = fmt.filesize ? `<small>${escapeHtml(fmt.filesize)}</small>` : "";
-      const icon = fmt.kind === "audio" ? "♪" : "↓";
+      const icon = { audio: "♪", image: "▣", stream: "≋" }[fmt.kind] || "↓";
+      // Point at our own endpoint rather than the CDN link. It re-resolves the
+      // post (CDN URLs expire), replays the headers the CDN demands, and sends
+      // Content-Disposition: attachment so the browser saves instead of playing.
+      const href =
+        `${API_ROOT}/api/download` +
+        `?url=${encodeURIComponent(sourceUrl)}` +
+        `&index=${encodeURIComponent(item.index ?? 0)}` +
+        `&format_id=${encodeURIComponent(fmt.format_id || "")}`;
       return `<a class="format-btn ${i === 0 ? "is-primary" : ""}"
-                 href="${escapeHtml(fmt.url)}"
-                 download="${escapeHtml(toFilename(item.title, fmt.ext))}"
-                 target="_blank" rel="noopener noreferrer">
+                 href="${escapeHtml(href)}"
+                 download="${escapeHtml(toFilename(item.title, fmt.ext))}">
                 <span aria-hidden="true">${icon}</span>
                 ${escapeHtml(fmt.label)} · ${escapeHtml(fmt.ext)} ${size}
               </a>`;
@@ -166,17 +173,34 @@ function renderCard(item, platform, index, total) {
   return card;
 }
 
-function renderResults(data) {
+function renderResults(data, requestedUrl) {
   results.innerHTML = "";
   const items = data.items || [];
+  const sourceUrl = data.source_url || requestedUrl;
   items.forEach((item, i) => {
-    results.appendChild(renderCard(item, data.platform, i, items.length));
+    results.appendChild(renderCard(item, data.platform, i, items.length, sourceUrl));
   });
   results.hidden = items.length === 0;
   if (items.length) {
     results.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
 }
+
+// The download endpoint re-resolves the post before any bytes arrive, so the
+// browser sits silent for a few seconds. Acknowledge the click so it does not
+// look ignored. There is no completion event for a plain navigation download,
+// so the label simply reverts on a timer.
+results.addEventListener("click", (event) => {
+  const btn = event.target.closest(".format-btn");
+  if (!btn || btn.dataset.busy) return;
+  const original = btn.innerHTML;
+  btn.dataset.busy = "1";
+  btn.innerHTML = '<span aria-hidden="true">⏳</span> Preparing…';
+  setTimeout(() => {
+    btn.innerHTML = original;
+    delete btn.dataset.busy;
+  }, 6000);
+});
 
 // ---- Submit ----------------------------------------------------------------
 form.addEventListener("submit", async (event) => {
@@ -217,7 +241,7 @@ form.addEventListener("submit", async (event) => {
       throw new Error(payload?.detail || `Request failed with status ${response.status}.`);
     }
 
-    renderResults(payload);
+    renderResults(payload, url);
   } catch (err) {
     // A network-level failure has no response body; name the likely cause.
     const message =

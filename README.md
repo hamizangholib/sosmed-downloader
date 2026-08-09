@@ -68,7 +68,7 @@ docker run --rm -p 7860:7860 saveflow-api
 
 The backend runs Python, so it cannot live on a static host. `backend/` deploys two ways with no code changes: serverless (Vercel detects `main.py` directly) or as a container (`backend/Dockerfile`).
 
-**Why no `ffmpeg` is needed:** the API sets `skip_download: True` and never merges streams. It reads metadata and returns the platform's own CDN URLs; the media itself never passes through the server. `ffmpeg` only matters when yt-dlp has to mux or transcode, which this app never does. It stays in the `Dockerfile` so the image also works for anyone who later adds server-side downloading.
+**Why no `ffmpeg` is needed:** yt-dlp runs with `skip_download: True` and never merges streams. `/api/download` copies an already-complete file through byte for byte without re-encoding. `ffmpeg` only matters for muxing or transcoding, which this app never does — which is also why HLS-only posts cannot be offered as a saveable file. It stays in the `Dockerfile` for anyone who later adds remuxing.
 
 | Host | Free? | Card needed | Sleeps when idle | Notes |
 | --- | --- | --- | --- | --- |
@@ -137,7 +137,7 @@ Spaces expose port `7860` only — the image already defaults to it, so no confi
 
 - CORS is open to `*`, so GitHub Pages can call the API from a different origin.
 - On free tiers the container sleeps when idle. The first request afterwards spends 30–60 s waking it; the frontend shows a "server may be waking up" hint once a request passes 8 seconds.
-- Bandwidth stays cheap: the API only returns CDN links, and the media itself downloads straight from the platform to the visitor's browser. It never passes through your server.
+- Media is streamed through `GET /api/download`, so it counts against your host's transfer allowance. On Vercel's Hobby plan that is 100 GB/month — roughly 10,000 downloads of a typical 10 MB clip. Function duration caps the largest single file: 60 s on Hobby, which is comfortable for short-form video but not for long uploads.
 - Platforms rate-limit datacenter IP ranges, and some block them outright. Instagram and Facebook are the strictest. This affects every cloud host equally — it is a limitation of the approach, not of the host you pick.
 - `yt-dlp` breaks whenever a platform changes its internals. Bump the pinned version in `requirements.txt` and redeploy when extraction starts failing.
 
@@ -214,6 +214,23 @@ Response `200`:
 ```
 
 Carousels return one entry per slide in `items`. The top-level `title`/`thumbnail`/`duration` mirror the first item.
+
+### `GET /api/download`
+
+```
+/api/download?url=<original post url>&index=<item>&format_id=<id>
+```
+
+Streams the chosen media back with `Content-Disposition: attachment`, so the browser saves the file instead of playing it.
+
+It takes the **original post URL**, not a CDN link, and re-resolves it on every call. That is deliberate:
+
+- CDN links expire within hours, so a results card left open would otherwise hand out dead links.
+- Platform CDNs answer `403` when a request arrives without the `Referer`/`User-Agent` yt-dlp negotiated. Streaming through the API lets those headers be replayed.
+- Browsers ignore the HTML `download` attribute cross-origin, so only a server-set `Content-Disposition` can force a save.
+- Accepting only post URLs keeps the endpoint from working as an open proxy — it can only fetch what yt-dlp resolved for a supported platform.
+
+The cost is bandwidth: media now passes through the API instead of going straight from the CDN to the visitor. See the note on transfer limits below.
 
 Errors come back as FastAPI's standard shape, and the frontend displays `detail` verbatim:
 

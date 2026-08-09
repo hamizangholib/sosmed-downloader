@@ -1,22 +1,35 @@
 """
 Saveflow API — social media media extractor.
 
-Wraps yt-dlp metadata extraction (download=False) behind a small JSON API so a
-static frontend on GitHub Pages can resolve direct media URLs without shipping
-yt-dlp to the browser.
+Two endpoints:
+
+  POST /api/extract   metadata + the list of available formats
+  GET  /api/download  streams one of those formats back as a file attachment
+
+The download endpoint exists because a browser cannot reliably save a
+cross-origin CDN link on its own: the HTML `download` attribute is ignored
+cross-origin, and platform CDNs reject requests that arrive without the
+`Referer`/`User-Agent` headers yt-dlp negotiated. Streaming through here lets us
+replay those headers and set `Content-Disposition: attachment`, which every
+browser honours.
 """
 
+import mimetypes
 import re
+import urllib.error
+import urllib.request
+from urllib.parse import quote
 
 import yt_dlp
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 app = FastAPI(
     title="Saveflow API",
     description="Extract direct media links from TikTok, Instagram, Facebook, X and Threads.",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 # Frontend is hosted on a different origin (GitHub Pages), so allow every origin.
@@ -37,8 +50,8 @@ PLATFORM_NAMES = {
     "threads": "Threads",
 }
 
-# Options shared by every extraction. `quiet` keeps container logs readable and
-# `skip_download` guarantees we never write media to the Space's ephemeral disk.
+# Options shared by every extraction. `skip_download` guarantees yt-dlp never
+# writes media to disk — we only ever want the metadata it resolves.
 YDL_OPTS = {
     "quiet": True,
     "no_warnings": True,
@@ -47,10 +60,23 @@ YDL_OPTS = {
     "extract_flat": False,
 }
 
+# Adaptive streaming protocols. A browser cannot save these as one file without
+# remuxing, so they are only ever offered when nothing else exists.
+STREAMING_PROTOCOLS = ("m3u8", "m3u8_native", "http_dash_segments", "mhtml")
+
+IMAGE_EXTS = ("jpg", "jpeg", "png", "webp", "heic", "gif")
+
+CHUNK_SIZE = 64 * 1024
+UPSTREAM_TIMEOUT = 30
+
 
 class ExtractRequest(BaseModel):
     url: str
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def friendly_platform(info: dict) -> str:
     """Turn a yt-dlp extractor key such as `TikTok:user` into `TikTok`."""
@@ -73,58 +99,138 @@ def human_size(num_bytes) -> str | None:
     return f"{size:.1f} TB"
 
 
+def safe_filename(title: str | None, ext: str | None) -> str:
+    """Build a filesystem-safe download name. Never returns an empty stem."""
+    base = re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", str(title or "")).strip()
+    base = re.sub(r"\s+", " ", base)[:80].strip() or "saveflow"
+    return f"{base}.{ext or 'mp4'}"
+
+
+def extract_info(url: str) -> dict:
+    """Run yt-dlp and translate its failures into meaningful HTTP errors."""
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        raise HTTPException(status_code=400, detail="Please enter a valid http(s) URL.")
+
+    try:
+        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as exc:
+        message = str(exc)
+        lowered = message.lower()
+        if "private" in lowered or "login" in lowered or "cookies" in lowered:
+            detail = "This post is private or requires a login, so it cannot be fetched."
+        elif "unsupported url" in lowered:
+            detail = "That link is not supported. Try TikTok, Instagram, Facebook, X or Threads."
+        elif "not exist" in lowered or "404" in lowered or "unavailable" in lowered:
+            detail = "The post could not be found. It may have been deleted."
+        elif "region" in lowered or "geo" in lowered:
+            detail = "This post is blocked in the region the server runs from."
+        else:
+            detail = "Could not extract media from that link. Double-check the URL and try again."
+        raise HTTPException(status_code=400, detail=detail) from exc
+    except Exception as exc:  # noqa: BLE001 — last-resort guard, never 500 blindly
+        raise HTTPException(status_code=500, detail=f"Unexpected server error: {exc}") from exc
+
+    if not info:
+        raise HTTPException(status_code=400, detail="No media found at that link.")
+    return info
+
+
+def entries_of(info: dict) -> list[dict]:
+    """Flatten a post into a list of media items (carousels have several)."""
+    entries = info.get("entries")
+    if entries:
+        return [e for e in entries if e]
+    return [info]
+
+
+def classify(fmt: dict) -> str | None:
+    """
+    Decide what a raw yt-dlp format actually is.
+
+    Returns "video", "audio", "image", "stream" (adaptive, not directly
+    saveable), or None when the entry carries nothing we can hand to a browser.
+    """
+    if not fmt.get("url"):
+        return None
+
+    if (fmt.get("protocol") or "") in STREAMING_PROTOCOLS:
+        return "stream"
+
+    has_video = fmt.get("vcodec") not in (None, "none")
+    has_audio = fmt.get("acodec") not in (None, "none")
+    ext = (fmt.get("ext") or "").lower()
+
+    if has_video:
+        return "video"
+    if has_audio:
+        return "audio"
+    # Photo posts and TikTok slideshows arrive with no codecs at all. They used
+    # to be dropped here, which is why some posts reported "nothing to download".
+    if ext in IMAGE_EXTS or (fmt.get("width") and not fmt.get("fps")):
+        return "image"
+    return None
+
+
 def build_formats(info: dict) -> list[dict]:
     """
     Reduce yt-dlp's format list to the handful worth showing a human.
 
     Keeps one entry per resolution, prefers progressive files (video+audio in a
-    single stream) because those play straight from a browser download, and
-    always appends an audio-only option when one exists.
+    single stream), and appends audio-only and image entries when they exist.
+    Adaptive (HLS/DASH) formats are held back and only used when they are the
+    only thing available.
     """
     formats = info.get("formats") or []
+
     if not formats:
-        # Some extractors (single images, simple TikTok posts) return a bare url.
+        # Some extractors return a bare url with no format list at all.
         if info.get("url"):
             return [
                 {
+                    "format_id": info.get("format_id") or "0",
                     "url": info["url"],
                     "label": "Original",
                     "ext": info.get("ext") or "mp4",
                     "filesize": human_size(info.get("filesize")),
-                    "kind": "video",
+                    "kind": "image" if (info.get("ext") or "") in IMAGE_EXTS else "video",
                 }
             ]
         return []
 
     best_by_label: dict[str, dict] = {}
     audio_only: dict | None = None
+    images: list[dict] = []
+    streams: list[dict] = []
 
     for fmt in formats:
-        url = fmt.get("url")
-        if not url or fmt.get("protocol") in ("m3u8", "m3u8_native", "mhtml"):
-            # HLS manifests are not directly downloadable from a browser.
+        kind = classify(fmt)
+        if kind is None:
             continue
 
-        has_video = fmt.get("vcodec") not in (None, "none")
-        has_audio = fmt.get("acodec") not in (None, "none")
+        if kind == "stream":
+            streams.append(fmt)
+            continue
 
-        if not has_video and has_audio:
+        if kind == "image":
+            images.append(fmt)
+            continue
+
+        if kind == "audio":
             if audio_only is None or (fmt.get("abr") or 0) > (audio_only.get("abr") or 0):
                 audio_only = fmt
-            continue
-
-        if not has_video:
             continue
 
         height = fmt.get("height")
         label = f"{height}p" if height else (fmt.get("format_note") or "Video")
         candidate = {
-            "url": url,
+            "format_id": str(fmt.get("format_id") or ""),
+            "url": fmt["url"],
             "label": label,
             "ext": fmt.get("ext") or "mp4",
             "filesize": human_size(fmt.get("filesize") or fmt.get("filesize_approx")),
             "kind": "video",
-            "_progressive": has_audio,
+            "_progressive": fmt.get("acodec") not in (None, "none"),
             "_height": height or 0,
             "_tbr": fmt.get("tbr") or 0,
         }
@@ -140,13 +246,24 @@ def build_formats(info: dict) -> list[dict]:
             best_by_label[label] = candidate
 
     ordered = sorted(best_by_label.values(), key=lambda f: f["_height"], reverse=True)
-    result = [
-        {k: v for k, v in fmt.items() if not k.startswith("_")} for fmt in ordered[:6]
-    ]
+    result = [{k: v for k, v in fmt.items() if not k.startswith("_")} for fmt in ordered[:6]]
+
+    for img in images[:6]:
+        result.append(
+            {
+                "format_id": str(img.get("format_id") or ""),
+                "url": img["url"],
+                "label": f"{img['width']}px" if img.get("width") else "Image",
+                "ext": img.get("ext") or "jpg",
+                "filesize": human_size(img.get("filesize") or img.get("filesize_approx")),
+                "kind": "image",
+            }
+        )
 
     if audio_only:
         result.append(
             {
+                "format_id": str(audio_only.get("format_id") or ""),
                 "url": audio_only["url"],
                 "label": "Audio only",
                 "ext": audio_only.get("ext") or "m4a",
@@ -157,12 +274,29 @@ def build_formats(info: dict) -> list[dict]:
             }
         )
 
+    # Last resort: the post only publishes adaptive streams. Offer the best one
+    # rather than failing outright — it will not save as a playable file in every
+    # player, so it is labelled honestly.
+    if not result and streams:
+        best = max(streams, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0))
+        result.append(
+            {
+                "format_id": str(best.get("format_id") or ""),
+                "url": best["url"],
+                "label": f"{best.get('height') or ''}p stream".strip("p ").strip() or "Stream",
+                "ext": best.get("ext") or "mp4",
+                "filesize": None,
+                "kind": "stream",
+            }
+        )
+
     return result
 
 
-def build_item(info: dict) -> dict:
+def build_item(info: dict, index: int) -> dict:
     """Shape one media entry (a single post, or one slide of a carousel)."""
     return {
+        "index": index,
         "title": info.get("title") or info.get("description") or "Untitled media",
         "thumbnail": info.get("thumbnail"),
         "duration": info.get("duration"),
@@ -171,9 +305,58 @@ def build_item(info: dict) -> dict:
     }
 
 
+def pick_raw_format(item: dict, format_id: str | None) -> dict:
+    """
+    Find the raw yt-dlp format dict to stream.
+
+    The raw dict is what carries `http_headers`, which the CDN requires. Falls
+    back to the best available format when the requested id has expired.
+    """
+    formats = item.get("formats") or []
+
+    if format_id:
+        for fmt in formats:
+            if str(fmt.get("format_id")) == str(format_id) and fmt.get("url"):
+                return fmt
+
+    usable = [f for f in formats if classify(f) in ("video", "image", "audio")]
+    if usable:
+        return max(
+            usable,
+            key=lambda f: (
+                f.get("acodec") not in (None, "none"),
+                f.get("height") or 0,
+                f.get("tbr") or 0,
+            ),
+        )
+
+    if item.get("url"):
+        return item
+
+    raise HTTPException(
+        status_code=400,
+        detail="No downloadable file is available for this post.",
+    )
+
+
+def content_disposition(filename: str) -> str:
+    """
+    Build an attachment header that survives non-ASCII titles.
+
+    Sends a stripped ASCII name for old clients plus the RFC 5987 `filename*`
+    that modern browsers prefer.
+    """
+    ascii_name = re.sub(r"[^\x20-\x7e]", "_", filename).replace('"', "'")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
 @app.get("/")
 def healthcheck():
-    """Liveness probe — also what a visitor sees when they open the Space URL."""
+    """Liveness probe — also what a visitor sees when they open the API URL."""
     return {
         "status": "ok",
         "message": "Saveflow API is running.",
@@ -185,42 +368,11 @@ def healthcheck():
 @app.post("/api/extract")
 def extract(payload: ExtractRequest):
     url = (payload.url or "").strip()
+    info = extract_info(url)
 
-    if not re.match(r"^https?://", url, re.IGNORECASE):
-        raise HTTPException(status_code=400, detail="Please enter a valid http(s) URL.")
-
-    try:
-        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except yt_dlp.utils.DownloadError as exc:
-        # yt-dlp packs the real reason into the message; map it to something a
-        # human can act on instead of leaking a stack trace.
-        message = str(exc)
-        lowered = message.lower()
-        if "private" in lowered or "login" in lowered or "cookies" in lowered:
-            detail = "This post is private or requires a login, so it cannot be fetched."
-        elif "unsupported url" in lowered:
-            detail = "That link is not supported. Try TikTok, Instagram, Facebook, X or Threads."
-        elif "not exist" in lowered or "404" in lowered or "unavailable" in lowered:
-            detail = "The post could not be found. It may have been deleted."
-        else:
-            detail = "Could not extract media from that link. Double-check the URL and try again."
-        raise HTTPException(status_code=400, detail=detail) from exc
-    except Exception as exc:  # noqa: BLE001 — last-resort guard, never 500 blindly
-        raise HTTPException(
-            status_code=500, detail=f"Unexpected server error: {exc}"
-        ) from exc
-
-    if not info:
-        raise HTTPException(status_code=400, detail="No media found at that link.")
-
-    entries = info.get("entries")
-    if entries:
-        items = [build_item(e) for e in entries if e]
-    else:
-        items = [build_item(info)]
-
+    items = [build_item(entry, i) for i, entry in enumerate(entries_of(info))]
     items = [item for item in items if item["formats"]]
+
     if not items:
         raise HTTPException(
             status_code=400,
@@ -239,29 +391,138 @@ def extract(payload: ExtractRequest):
     }
 
 
+@app.get("/api/download")
+def download(
+    url: str = Query(..., description="The original post URL, not the CDN link."),
+    index: int = Query(0, ge=0, description="Which carousel item to fetch."),
+    format_id: str | None = Query(None, description="Format id from /api/extract."),
+):
+    """
+    Stream one media file back to the browser as an attachment.
+
+    Takes the original post URL rather than a CDN link on purpose. Re-resolving
+    means the link is always fresh (CDN URLs expire within hours) and it makes
+    this endpoint unusable as an open proxy — it can only ever fetch URLs that
+    yt-dlp itself produced for a supported platform.
+    """
+    info = extract_info(url)
+    items = entries_of(info)
+
+    if index >= len(items):
+        raise HTTPException(status_code=400, detail="That item is not part of this post.")
+
+    item = items[index]
+    fmt = pick_raw_format(item, format_id)
+    filename = safe_filename(item.get("title"), fmt.get("ext"))
+
+    # Replay the headers yt-dlp negotiated. Without the right Referer and
+    # User-Agent, TikTok and Instagram CDNs answer 403 — that is the single most
+    # common reason a download link looks valid but fails.
+    headers = {**(info.get("http_headers") or {}), **(fmt.get("http_headers") or {})}
+
+    try:
+        upstream = urllib.request.urlopen(
+            urllib.request.Request(fmt["url"], headers=headers),
+            timeout=UPSTREAM_TIMEOUT,
+        )
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"The platform's CDN refused the download (HTTP {exc.code}).",
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 — network failures of every shape
+        raise HTTPException(
+            status_code=502, detail=f"Could not reach the media file: {exc}"
+        ) from exc
+
+    def stream():
+        try:
+            while chunk := upstream.read(CHUNK_SIZE):
+                yield chunk
+        finally:
+            upstream.close()
+
+    response_headers = {"Content-Disposition": content_disposition(filename)}
+    length = upstream.headers.get("Content-Length")
+    if length:
+        # Lets the browser show a real progress bar instead of an unknown size.
+        response_headers["Content-Length"] = length
+
+    media_type = (
+        upstream.headers.get("Content-Type")
+        or mimetypes.guess_type(filename)[0]
+        or "application/octet-stream"
+    )
+
+    return StreamingResponse(stream(), media_type=media_type, headers=response_headers)
+
+
+# ---------------------------------------------------------------------------
+# Self-check
+# ---------------------------------------------------------------------------
+
 def _self_check() -> None:
     """`python main.py` runs this — smoke test for the format-picking logic."""
-    info = {
+    video_info = {
         "extractor_key": "TikTok:user",
         "formats": [
             # Same resolution twice: the progressive one must win.
-            {"url": "a", "height": 1080, "vcodec": "h264", "acodec": "none", "tbr": 9000, "ext": "mp4"},
-            {"url": "b", "height": 1080, "vcodec": "h264", "acodec": "mp4a", "tbr": 3000, "ext": "mp4"},
-            {"url": "c", "height": 720, "vcodec": "h264", "acodec": "mp4a", "tbr": 1500, "ext": "mp4",
-             "filesize": 8_400_000},
-            # HLS manifests are not browser-downloadable and must be dropped.
-            {"url": "d", "height": 480, "vcodec": "h264", "acodec": "mp4a", "protocol": "m3u8_native"},
-            {"url": "e", "vcodec": "none", "acodec": "mp4a", "abr": 128, "ext": "m4a"},
+            {"format_id": "v1", "url": "a", "height": 1080, "vcodec": "h264",
+             "acodec": "none", "tbr": 9000, "ext": "mp4"},
+            {"format_id": "v2", "url": "b", "height": 1080, "vcodec": "h264",
+             "acodec": "mp4a", "tbr": 3000, "ext": "mp4"},
+            {"format_id": "v3", "url": "c", "height": 720, "vcodec": "h264",
+             "acodec": "mp4a", "tbr": 1500, "ext": "mp4", "filesize": 8_400_000},
+            # Adaptive stream: held back while progressive formats exist.
+            {"format_id": "hls", "url": "d", "height": 480, "vcodec": "h264",
+             "acodec": "mp4a", "protocol": "m3u8_native"},
+            {"format_id": "a1", "url": "e", "vcodec": "none", "acodec": "mp4a",
+             "abr": 128, "ext": "m4a"},
         ],
     }
-    fmts = build_formats(info)
-    labels = [f["label"] for f in fmts]
-    assert labels == ["1080p", "720p", "Audio only"], labels
+    fmts = build_formats(video_info)
+    assert [f["label"] for f in fmts] == ["1080p", "720p", "Audio only"], fmts
     assert fmts[0]["url"] == "b", "progressive stream should beat video-only at 1080p"
+    assert fmts[0]["format_id"] == "v2"
     assert fmts[1]["filesize"] == "8.0 MB", fmts[1]["filesize"]
     assert fmts[-1]["kind"] == "audio"
-    assert friendly_platform(info) == "TikTok"
-    assert build_formats({"url": "z", "ext": "jpg"})[0]["label"] == "Original"
+    assert friendly_platform(video_info) == "TikTok"
+
+    # Photo posts carry no codecs at all — these used to be dropped, which made
+    # TikTok slideshows report "nothing to download".
+    photo_info = {
+        "formats": [
+            {"format_id": "i1", "url": "p1", "ext": "jpg", "width": 1080},
+            {"format_id": "i2", "url": "p2", "ext": "webp", "width": 720},
+        ]
+    }
+    photos = build_formats(photo_info)
+    assert [f["kind"] for f in photos] == ["image", "image"], photos
+    assert photos[0]["label"] == "1080px"
+
+    # HLS-only posts still return something rather than failing outright.
+    hls_only = {"formats": [{"format_id": "h", "url": "s", "height": 720,
+                             "vcodec": "h264", "acodec": "mp4a",
+                             "protocol": "m3u8_native"}]}
+    fallback = build_formats(hls_only)
+    assert len(fallback) == 1 and fallback[0]["kind"] == "stream", fallback
+
+    # Bare-url extractors.
+    assert build_formats({"url": "z", "ext": "jpg"})[0]["kind"] == "image"
+    assert build_formats({}) == []
+
+    # Format selection for the download endpoint.
+    assert pick_raw_format(video_info, "v3")["url"] == "c"
+    assert pick_raw_format(video_info, "gone")["url"] == "b", "falls back to best"
+
+    # Filenames must be safe and never empty, and headers must not be injectable.
+    assert safe_filename('a/b:c*d"e', "mp4") == "a b c d e.mp4"
+    assert safe_filename("   ", None) == "saveflow.mp4"
+    assert safe_filename("x\r\nSet-Cookie: y", "mp4") == "x Set-Cookie y.mp4"
+    header = content_disposition(safe_filename("Kucing 🐈 lucu", "mp4"))
+    assert "\r" not in header and "\n" not in header
+    assert "filename*=UTF-8''" in header
+
     assert human_size(None) is None
     print("self-check ok")
 
