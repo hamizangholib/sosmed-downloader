@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Secrets
+.env
+.env.*
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local tooling (preview server config for Claude Code)
+.claude/
+
+# Design reference only — not part of the app, ~3 MB of template vendor files.
+# Delete this line if you want the reference committed.
+referensi/
+
+# Logs
+*.log

@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Saveflow — Download video from TikTok, Instagram, Facebook, X &amp; Threads</title>
+  <meta name="description" content="Saveflow extracts direct download links for videos and photos from TikTok, Instagram, Facebook, X (Twitter) and Threads. No watermark hassle, no sign-up." />
+
+  <!-- Roboto matches the reference design's typographic feel. -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700;900&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="style.css" />
+  <link rel="icon" type="image/svg+xml" href="assets/logo.svg" />
+</head>
+<body>
+
+  <!-- ============ HEADER ============ -->
+  <header class="site-header" id="siteHeader">
+    <div class="container header-inner">
+      <a class="brand" href="#top">
+        <img class="brand-mark" src="assets/logo.svg" width="36" height="36" alt="" />
+        <span class="brand-text">Save<em>flow</em></span>
+      </a>
+
+      <nav class="site-nav" id="siteNav">
+        <a href="#top">Home</a>
+        <a href="#how">How it works</a>
+        <a href="#features">Features</a>
+      </nav>
+
+      <button class="nav-toggle" id="navToggle" aria-label="Toggle navigation" aria-expanded="false">
+        <span></span><span></span><span></span>
+      </button>
+    </div>
+  </header>
+
+  <main id="top">
+
+    <!-- ============ HERO + DOWNLOADER ============ -->
+    <section class="hero">
+      <div class="hero-glow" aria-hidden="true"></div>
+      <div class="container hero-inner">
+
+        <span class="pill-tag">Free · No sign-up · No watermark hassle</span>
+
+        <h1 class="hero-title">
+          Save any post,<br />
+          <em>in one flow.</em>
+        </h1>
+
+        <p class="hero-sub">
+          Paste a link from TikTok, Instagram, Facebook, X or Threads.
+          Saveflow pulls the original file and hands you a direct download.
+        </p>
+
+        <!-- Downloader form -->
+        <form class="downloader" id="downloadForm" autocomplete="off">
+          <div class="input-shell">
+            <span class="input-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                <path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7" />
+                <path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7" />
+              </svg>
+            </span>
+
+            <input
+              type="text"
+              id="urlInput"
+              name="url"
+              placeholder="Paste a video or photo link here…"
+              aria-label="Media URL"
+              spellcheck="false"
+            />
+
+            <button type="button" class="paste-btn" id="pasteBtn" title="Paste from clipboard">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="9" y="3" width="6" height="4" rx="1" />
+                <path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2" />
+              </svg>
+              <span>Paste</span>
+            </button>
+          </div>
+
+          <button type="submit" class="btn-gradient" id="submitBtn">
+            <span class="btn-label">Download</span>
+          </button>
+        </form>
+
+        <!-- Supported platform badges -->
+        <ul class="platforms" aria-label="Supported platforms">
+          <li><span class="dot dot-tiktok"></span>TikTok</li>
+          <li><span class="dot dot-instagram"></span>Instagram</li>
+          <li><span class="dot dot-facebook"></span>Facebook</li>
+          <li><span class="dot dot-x"></span>X (Twitter)</li>
+          <li><span class="dot dot-threads"></span>Threads</li>
+        </ul>
+
+        <!-- Error banner (populated by script.js) -->
+        <div class="alert" id="errorAlert" role="alert" hidden>
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <circle cx="12" cy="12" r="9" /><path d="M12 8v5" /><path d="M12 16.5v.01" />
+          </svg>
+          <p id="errorText"></p>
+          <button type="button" class="alert-close" id="errorClose" aria-label="Dismiss">&times;</button>
+        </div>
+
+        <!-- Loading skeleton -->
+        <div class="skeleton" id="loadingState" hidden aria-live="polite">
+          <div class="spinner" aria-hidden="true"></div>
+          <div class="skeleton-body">
+            <div class="skeleton-thumb shimmer"></div>
+            <div class="skeleton-lines">
+              <div class="shimmer line w70"></div>
+              <div class="shimmer line w40"></div>
+              <div class="shimmer line w55"></div>
+            </div>
+          </div>
+          <p class="skeleton-note">Fetching media… this can take a few seconds.</p>
+        </div>
+
+        <!-- Results (cards injected by script.js) -->
+        <div class="results" id="results" hidden></div>
+
+      </div>
+    </section>
+
+    <!-- ============ HOW IT WORKS ============ -->
+    <section class="section" id="how">
+      <div class="container">
+        <div class="section-heading">
+          <h2>Three steps, <em>zero friction</em></h2>
+          <span class="heading-rule" aria-hidden="true"></span>
+          <p>No account, no extension, no desktop install. Works on phone and laptop alike.</p>
+        </div>
+
+        <ol class="steps">
+          <li>
+            <span class="step-num">01</span>
+            <h3>Copy the link</h3>
+            <p>Use the native <em>Share → Copy link</em> option in the app, or grab the URL from your browser bar.</p>
+          </li>
+          <li>
+            <span class="step-num">02</span>
+            <h3>Paste into Saveflow</h3>
+            <p>Drop it in the box above and hit Download. We resolve the post and read its real media sources.</p>
+          </li>
+          <li>
+            <span class="step-num">03</span>
+            <h3>Pick your quality</h3>
+            <p>Choose a resolution — or audio only — and the file saves straight to your device.</p>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- ============ FEATURES ============ -->
+    <section class="section section-alt" id="features">
+      <div class="container">
+        <div class="section-heading">
+          <h2>Built to be <em>fast and quiet</em></h2>
+          <span class="heading-rule" aria-hidden="true"></span>
+          <p>Saveflow does one job and gets out of the way.</p>
+        </div>
+
+        <div class="feature-grid">
+          <article class="feature-card">
+            <span class="feature-icon">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M13 2L4.5 13H11l-1 9 8.5-11H12l1-9z" />
+              </svg>
+            </span>
+            <h3>Direct source files</h3>
+            <p>Links point at the platform's own CDN, so downloads run at full speed and skip re-encoding.</p>
+          </article>
+
+          <article class="feature-card">
+            <span class="feature-icon">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 3l7 3v6c0 4.5-3 7.7-7 9-4-1.3-7-4.5-7-9V6l7-3z" />
+                <path d="M9.5 12l2 2 3.5-4" />
+              </svg>
+            </span>
+            <h3>Nothing stored</h3>
+            <p>We never keep your links or the media. Every request is resolved in memory and then forgotten.</p>
+          </article>
+
+          <article class="feature-card">
+            <span class="feature-icon">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="4" width="18" height="13" rx="2" />
+                <path d="M8 21h8" /><path d="M12 17v4" />
+              </svg>
+            </span>
+            <h3>Every screen size</h3>
+            <p>One responsive layout that stays usable from a 360px phone up to an ultrawide monitor.</p>
+          </article>
+
+          <article class="feature-card">
+            <span class="feature-icon">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9 18V5l12-2v13" />
+                <circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" />
+              </svg>
+            </span>
+            <h3>Audio extraction</h3>
+            <p>When a post carries a separate audio track, Saveflow offers it as its own download.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ============ FOOTER ============ -->
+  <footer class="site-footer">
+    <div class="container footer-inner">
+      <p class="footer-brand">
+        <img src="assets/logo.svg" width="26" height="26" alt="" />
+        Save<em>flow</em>
+      </p>
+      <p class="footer-note">
+        For personal use only. Respect creators and platform terms of service.
+      </p>
+    </div>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+</html>
