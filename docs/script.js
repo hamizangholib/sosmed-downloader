@@ -22,6 +22,10 @@
    ------------------------------------------------------------------------- */
 const API_BASE_URL = "https://saveflow-ten.vercel.app/";
 
+// A trailing slash here would produce `...app//api/extract`, which is a
+// different route and 404s. Strip it once so either spelling works.
+const API_ROOT = API_BASE_URL.replace(/\/+$/, "");
+
 // ---- Element handles -------------------------------------------------------
 const form = document.getElementById("downloadForm");
 const urlInput = document.getElementById("urlInput");
@@ -200,7 +204,7 @@ form.addEventListener("submit", async (event) => {
   setLoading(true);
 
   try {
-    const response = await fetch(`${API_BASE_URL}/api/extract`, {
+    const response = await fetch(`${API_ROOT}/api/extract`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url }),

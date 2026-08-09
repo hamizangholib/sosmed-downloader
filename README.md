@@ -11,7 +11,7 @@ Social media downloader. Paste a link from **TikTok, Instagram, Facebook, X (Twi
 │   ├── main.py            # FastAPI app: GET / and POST /api/extract
 │   ├── requirements.txt
 │   └── Dockerfile         # python:3.10-slim + ffmpeg, port from $PORT (default 7860)
-├── frontend/
+├── docs/                  # the website — GitHub Pages publishes this folder
 │   ├── index.html
 │   ├── style.css
 │   └── script.js          # API_BASE_URL lives at the top of this file
@@ -147,38 +147,29 @@ Spaces expose port `7860` only — the image already defaults to it, so no confi
 
 ### 3a. Point the frontend at your API
 
-Open [frontend/script.js](frontend/script.js) and edit the constant at the top — no trailing slash:
+Open [docs/script.js](docs/script.js) and edit the constant at the top:
 
 ```js
 const API_BASE_URL = "https://saveflow-api.vercel.app";
 ```
 
+A trailing slash is tolerated — the code strips it before building the request URL.
+
 Test locally before deploying:
 
 ```bash
-cd frontend && python -m http.server 5500
+cd docs && python -m http.server 5500
 ```
 
 Then open <http://127.0.0.1:5500>. Serve it over HTTP rather than opening `index.html` from disk — the clipboard API needs a secure context, and `file://` is not one.
 
 ### 3b. Publish
 
-```bash
-git init && git add . && git commit -m "Saveflow"
-```
+GitHub Pages can only publish from the repository root or from a folder named exactly `docs/` — no other folder name works without a build workflow. That is why the site lives in `docs/` rather than `frontend/`.
 
-```bash
-git remote add origin https://github.com/<your-username>/saveflow.git && git branch -M main && git push -u origin main
-```
+Push the repository, then in the repo on GitHub: **Settings → Pages → Source: Deploy from a branch → Branch `main` → Folder `/docs`** and Save.
 
-Then in the repo: **Settings → Pages → Source: Deploy from a branch → Branch `main` → Folder `/ (root)`** and Save.
-
-Because the site files live in `frontend/`, either:
-
-- **Option A** — move `index.html`, `style.css` and `script.js` to the repository root, or
-- **Option B** — keep the folder and select `/docs` in the Pages settings after renaming `frontend/` to `docs/`.
-
-Your site goes live at `https://<your-username>.github.io/saveflow/` within a minute or two.
+Your site goes live at `https://<your-username>.github.io/<repo-name>/` within a minute or two.
 
 ---
 
