@@ -16,15 +16,15 @@ browser honours.
 
 import mimetypes
 import re
-import urllib.error
-import urllib.request
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from yt_dlp.networking import Request as YdlRequest
+from yt_dlp.networking.exceptions import HTTPError as YdlHTTPError
 
 app = FastAPI(
     title="Saveflow API",
@@ -58,6 +58,7 @@ YDL_OPTS = {
     "skip_download": True,
     "noplaylist": False,  # Instagram carousels arrive as a playlist of entries.
     "extract_flat": False,
+    "socket_timeout": 30,
 }
 
 # Adaptive streaming protocols. A browser cannot save these as one file without
@@ -67,7 +68,6 @@ STREAMING_PROTOCOLS = ("m3u8", "m3u8_native", "http_dash_segments", "mhtml")
 IMAGE_EXTS = ("jpg", "jpeg", "png", "webp", "heic", "gif")
 
 CHUNK_SIZE = 64 * 1024
-UPSTREAM_TIMEOUT = 30
 
 
 class ExtractRequest(BaseModel):
@@ -106,14 +106,13 @@ def safe_filename(title: str | None, ext: str | None) -> str:
     return f"{base}.{ext or 'mp4'}"
 
 
-def extract_info(url: str) -> dict:
-    """Run yt-dlp and translate its failures into meaningful HTTP errors."""
+def run_extraction(ydl, url: str) -> dict:
+    """Run yt-dlp on an existing session and map its failures to HTTP errors."""
     if not re.match(r"^https?://", url, re.IGNORECASE):
         raise HTTPException(status_code=400, detail="Please enter a valid http(s) URL.")
 
     try:
-        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
-            info = ydl.extract_info(url, download=False)
+        info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as exc:
         message = str(exc)
         lowered = message.lower()
@@ -134,6 +133,12 @@ def extract_info(url: str) -> dict:
     if not info:
         raise HTTPException(status_code=400, detail="No media found at that link.")
     return info
+
+
+def extract_info(url: str) -> dict:
+    """One-shot extraction for callers that do not need the session afterwards."""
+    with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+        return run_extraction(ydl, url)
 
 
 def entries_of(info: dict) -> list[dict]:
@@ -404,33 +409,45 @@ def download(
     means the link is always fresh (CDN URLs expire within hours) and it makes
     this endpoint unusable as an open proxy — it can only ever fetch URLs that
     yt-dlp itself produced for a supported platform.
+
+    The fetch goes through the *same* yt-dlp session that did the extraction.
+    That matters: platform CDNs validate the cookies handed out during
+    extraction (TikTok's `ttwid`, for one), so a hand-rolled request carrying
+    only the headers — however correct — still gets a 403.
     """
-    info = extract_info(url)
-    items = entries_of(info)
-
-    if index >= len(items):
-        raise HTTPException(status_code=400, detail="That item is not part of this post.")
-
-    item = items[index]
-    fmt = pick_raw_format(item, format_id)
-    filename = safe_filename(item.get("title"), fmt.get("ext"))
-
-    # Replay the headers yt-dlp negotiated. Without the right Referer and
-    # User-Agent, TikTok and Instagram CDNs answer 403 — that is the single most
-    # common reason a download link looks valid but fails.
-    headers = {**(info.get("http_headers") or {}), **(fmt.get("http_headers") or {})}
-
+    ydl = yt_dlp.YoutubeDL(YDL_OPTS)
     try:
-        upstream = urllib.request.urlopen(
-            urllib.request.Request(fmt["url"], headers=headers),
-            timeout=UPSTREAM_TIMEOUT,
-        )
-    except urllib.error.HTTPError as exc:
+        info = run_extraction(ydl, url)
+        items = entries_of(info)
+
+        if index >= len(items):
+            raise HTTPException(status_code=400, detail="That item is not part of this post.")
+
+        item = items[index]
+        fmt = pick_raw_format(item, format_id)
+        filename = safe_filename(item.get("title"), fmt.get("ext"))
+
+        headers = {**(info.get("http_headers") or {}), **(fmt.get("http_headers") or {})}
+        # Several CDNs (TikTok's especially) reject a plain GET but serve the
+        # same file happily for a range request, which is what a browser sends.
+        headers.setdefault("Range", "bytes=0-")
+
+        upstream = ydl.urlopen(YdlRequest(fmt["url"], headers=headers))
+    except HTTPException:
+        ydl.close()
+        raise
+    except YdlHTTPError as exc:
+        ydl.close()
+        host = urlsplit(fmt["url"]).hostname if fmt.get("url") else "the CDN"
         raise HTTPException(
             status_code=502,
-            detail=f"The platform's CDN refused the download (HTTP {exc.code}).",
+            detail=(
+                f"{host} refused the download (HTTP {exc.status}). "
+                "The post may be region-locked, or the platform is blocking this server's IP."
+            ),
         ) from exc
     except Exception as exc:  # noqa: BLE001 — network failures of every shape
+        ydl.close()
         raise HTTPException(
             status_code=502, detail=f"Could not reach the media file: {exc}"
         ) from exc
@@ -441,6 +458,7 @@ def download(
                 yield chunk
         finally:
             upstream.close()
+            ydl.close()
 
     response_headers = {"Content-Disposition": content_disposition(filename)}
     length = upstream.headers.get("Content-Length")
