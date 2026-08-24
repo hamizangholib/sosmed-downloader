@@ -95,6 +95,13 @@ def is_x_auth_gate(url: str, error: Exception) -> bool:
     ))
 
 
+def should_retry_x_auth(url: str, error: Exception) -> bool:
+    message = str(error).lower()
+    return is_x_auth_gate(url, error) or (
+        is_x_url(url) and "no video could be found in this tweet" in message
+    )
+
+
 def normalize_cookie_value(value: str | None, cookie_name: str) -> str | None:
     """Accept a raw DevTools value or a pasted `name=value` pair."""
     value = (value or "").strip()
@@ -234,7 +241,7 @@ def extract_with_session(url: str):
     try:
         return ydl, run_extraction(ydl, url)
     except HTTPException as exc:
-        if not is_x_auth_gate(url, exc.__cause__ or exc) or not x_auth_configured():
+        if not should_retry_x_auth(url, exc.__cause__ or exc) or not x_auth_configured():
             ydl.close()
             raise
 
@@ -673,6 +680,12 @@ def _self_check() -> None:
     )
     assert not is_x_auth_gate("https://x.com/user/status/1", Exception("Protected tweet"))
     assert not is_x_auth_gate("https://example.com/1", Exception("NSFW"))
+    assert should_retry_x_auth(
+        "https://x.com/user/status/1", Exception("No video could be found in this tweet")
+    )
+    assert not should_retry_x_auth(
+        "https://example.com/1", Exception("No video could be found in this tweet")
+    )
     assert normalize_cookie_value(' "auth_token=test-auth" ', "auth_token") == "test-auth"
     assert normalize_cookie_value("test-csrf", "ct0") == "test-csrf"
 
