@@ -253,13 +253,6 @@ def extract_with_session(url: str):
         ydl.close()
         raise
 
-    entries = info.get("entries") or [info]
-    if not any((entry or {}).get("age_limit") == 18 for entry in entries):
-        ydl.close()
-        raise HTTPException(
-            status_code=403,
-            detail="Authenticated X access is limited to media explicitly marked as sensitive.",
-        )
     return ydl, info
 
 

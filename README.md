@@ -166,9 +166,10 @@ Setelah redeploy, buka URL backend dan pastikan `x_auth.configured` bernilai
 `true`. Nilai cookie tidak pernah ditampilkan oleh endpoint tersebut.
 
 Saveflow hanya memakai sesi tersebut setelah permintaan anonim X secara
-eksplisit meminta autentikasi atau ditolak sebagai konten NSFW/sensitif. Hasil
-autentikasi hanya dikembalikan jika berstatus `age_limit: 18`, sehingga media
-privat biasa tetap ditolak.
+eksplisit meminta autentikasi atau menyembunyikan media. Hasil retry yang
+berhasil tidak bergantung pada metadata `age_limit`, karena field tersebut
+tidak selalu konsisten pada postingan X. Error eksplisit untuk tweet privat
+tetap tidak dicoba ulang memakai sesi akun.
 
 #### Vercel (Rekomendasi - Gratis & Tanpa Kartu Kredit)
 
@@ -440,9 +441,9 @@ After redeploying, open the backend URL and verify that `x_auth.configured` is
 `true`. The endpoint never exposes the cookie values.
 
 Saveflow only uses this session after an anonymous X request is explicitly
-asked to authenticate or rejected as NSFW/sensitive. The authenticated result
-is only returned when it reports `age_limit: 18`, so ordinary private media
-remains blocked.
+asks to authenticate or hides the media. A successful retry does not depend on
+the `age_limit` metadata because X does not report that field consistently.
+Explicit protected-tweet errors are still not retried with the account session.
 
 #### Vercel (Recommended - Free & No Credit Card)
 
