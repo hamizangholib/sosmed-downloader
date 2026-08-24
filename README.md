@@ -147,6 +147,26 @@ docker run --rm -p 7860:7860 saveflow-api
 
 Backend berbasis FastAPI dapat dideploy ke berbagai layanan cloud secara gratis:
 
+#### Mengaktifkan video sensitif X (Twitter)
+
+X mewajibkan sesi login untuk sebagian media yang ditandai sensitif. Tambahkan
+dua environment variable berikut pada backend:
+
+```text
+X_AUTH_TOKEN=<nilai cookie auth_token dari x.com>
+X_CT0=<nilai cookie ct0 dari x.com>
+```
+
+Di Vercel, buka **Project Settings → Environment Variables**, simpan keduanya,
+lalu redeploy backend. Ambil nilainya dari DevTools browser (**Application →
+Cookies → https://x.com**) saat akun X sedang login. Jangan commit nilainya ke
+Git atau mengirimkannya melalui chat.
+
+Saveflow hanya memakai sesi tersebut setelah permintaan anonim X secara
+eksplisit ditolak sebagai konten NSFW/sensitif, lalu hasil autentikasi juga
+harus berstatus `age_limit: 18`. Kegagalan karena tweet atau akun privat tidak
+dicoba ulang memakai sesi akun.
+
 #### Vercel (Rekomendasi - Gratis & Tanpa Kartu Kredit)
 
 1. Push repositori ini ke GitHub.
@@ -397,6 +417,26 @@ docker run --rm -p 7860:7860 saveflow-api
 ### Backend Deployment Guide
 
 The Python FastAPI backend can be easily deployed to zero-cost cloud hosts:
+
+#### Enabling sensitive X (Twitter) videos
+
+X requires a logged-in session for some media marked as sensitive. Add these
+two environment variables to the backend:
+
+```text
+X_AUTH_TOKEN=<the auth_token cookie value from x.com>
+X_CT0=<the ct0 cookie value from x.com>
+```
+
+On Vercel, open **Project Settings → Environment Variables**, save both values,
+and redeploy the backend. Copy the values from browser DevTools (**Application
+→ Cookies → https://x.com**) while the X account is logged in. Never commit the
+values to Git or send them through chat.
+
+Saveflow only uses this session after an anonymous X request is explicitly
+rejected as NSFW/sensitive, and the authenticated result must also report
+`age_limit: 18`. Private tweet/account failures are never retried with the
+account session.
 
 #### Vercel (Recommended - Free & No Credit Card)
 

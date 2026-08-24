@@ -1,0 +1,195 @@
+{
+  "communities": {
+    "0": [
+      "docs_script",
+      "docs_script_api_root",
+      "docs_script_clearerror",
+      "docs_script_erroralert",
+      "docs_script_errorclose",
+      "docs_script_errortext",
+      "docs_script_form",
+      "docs_script_header",
+      "docs_script_loadingnote",
+      "docs_script_loadingstate",
+      "docs_script_nav",
+      "docs_script_navtoggle",
+      "docs_script_pastebtn",
+      "docs_script_results",
+      "docs_script_setloading",
+      "docs_script_showerror",
+      "docs_script_submitbtn",
+      "docs_script_urlinput"
+    ],
+    "1": [
+      "backend_main_classify",
+      "backend_main_download",
+      "backend_main_entries_of",
+      "backend_main_healthcheck",
+      "backend_main_pick_raw_format",
+      "backend_main_rationale_103",
+      "backend_main_rationale_145",
+      "backend_main_rationale_153",
+      "backend_main_rationale_314",
+      "backend_main_rationale_364",
+      "backend_main_rationale_405",
+      "backend_main_safe_filename",
+      "get"
+    ],
+    "2": [
+      "backend_main",
+      "backend_main_build_formats",
+      "backend_main_content_disposition",
+      "backend_main_friendly_platform",
+      "backend_main_human_size",
+      "backend_main_rationale_1",
+      "backend_main_rationale_181",
+      "backend_main_rationale_348",
+      "backend_main_rationale_483",
+      "backend_main_rationale_82",
+      "backend_main_rationale_91",
+      "backend_main_self_check"
+    ],
+    "3": [
+      "backend_main_build_item",
+      "backend_main_extract",
+      "backend_main_extractrequest",
+      "backend_main_rationale_302",
+      "basemodel",
+      "post"
+    ],
+    "4": [
+      "docs_script_escapehtml",
+      "docs_script_formatduration",
+      "docs_script_rendercard",
+      "docs_script_renderresults",
+      "docs_script_tofilename"
+    ],
+    "5": [
+      "backend_main_extract_info",
+      "backend_main_rationale_110",
+      "backend_main_rationale_139",
+      "backend_main_run_extraction"
+    ]
+  },
+  "cohesion": {
+    "0": 0.1111111111111111,
+    "1": 0.19230769230769232,
+    "2": 0.24242424242424243,
+    "3": 0.3333333333333333,
+    "4": 0.4,
+    "5": 0.5
+  },
+  "gods": [
+    {
+      "id": "backend_main_extract",
+      "label": "extract()",
+      "degree": 8
+    },
+    {
+      "id": "backend_main_download",
+      "label": "download()",
+      "degree": 8
+    },
+    {
+      "id": "backend_main_self_check",
+      "label": "_self_check()",
+      "degree": 8
+    },
+    {
+      "id": "backend_main_build_formats",
+      "label": "build_formats()",
+      "degree": 7
+    },
+    {
+      "id": "backend_main_pick_raw_format",
+      "label": "pick_raw_format()",
+      "degree": 6
+    },
+    {
+      "id": "backend_main_friendly_platform",
+      "label": "friendly_platform()",
+      "degree": 5
+    },
+    {
+      "id": "backend_main_entries_of",
+      "label": "entries_of()",
+      "degree": 5
+    },
+    {
+      "id": "backend_main_classify",
+      "label": "classify()",
+      "degree": 5
+    },
+    {
+      "id": "backend_main_build_item",
+      "label": "build_item()",
+      "degree": 5
+    },
+    {
+      "id": "docs_script_rendercard",
+      "label": "renderCard()",
+      "degree": 5
+    }
+  ],
+  "surprises": [
+    {
+      "source": "extract()",
+      "target": "friendly_platform()",
+      "source_files": [
+        "backend/main.py",
+        "backend/main.py"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "note": "Bridges community 2 \u2192 community 3"
+    },
+    {
+      "source": "friendly_platform()",
+      "target": "get",
+      "source_files": [
+        "backend/main.py",
+        ""
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "note": "Bridges community 2 \u2192 community 1"
+    },
+    {
+      "source": "download()",
+      "target": "run_extraction()",
+      "source_files": [
+        "backend/main.py",
+        "backend/main.py"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "note": "Bridges community 5 \u2192 community 1"
+    },
+    {
+      "source": "extract()",
+      "target": "extract_info()",
+      "source_files": [
+        "backend/main.py",
+        "backend/main.py"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "note": "Bridges community 5 \u2192 community 3"
+    },
+    {
+      "source": "extract()",
+      "target": "entries_of()",
+      "source_files": [
+        "backend/main.py",
+        "backend/main.py"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "note": "Bridges community 1 \u2192 community 3"
+    }
+  ],
+  "tokens": {
+    "input": 0,
+    "output": 0
+  }
+}

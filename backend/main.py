@@ -15,7 +15,9 @@ browser honours.
 """
 
 import mimetypes
+import os
 import re
+from http.cookiejar import Cookie
 from urllib.parse import quote, urlsplit
 
 import yt_dlp
@@ -78,6 +80,58 @@ class ExtractRequest(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
+def is_x_url(url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower()
+    return host in ("x.com", "twitter.com") or host.endswith((".x.com", ".twitter.com"))
+
+
+def is_sensitive_x_error(url: str, error: Exception) -> bool:
+    """Only authorize a retry when X explicitly identifies an age/NSFW gate."""
+    message = str(error).lower()
+    return is_x_url(url) and any(marker in message for marker in (
+        "nsfw", "sensitive content", "sensitive media", "stated age", "age-restricted",
+    ))
+
+
+def x_auth_configured() -> bool:
+    return bool(os.getenv("X_AUTH_TOKEN") and os.getenv("X_CT0"))
+
+
+def add_x_auth_cookies(ydl, auth_token: str | None, ct0: str | None) -> bool:
+    """Attach an optional X session to yt-dlp without writing secrets to disk."""
+    if not auth_token or not ct0:
+        return False
+
+    for domain in (".x.com", ".twitter.com"):
+        for name, value in (("auth_token", auth_token), ("ct0", ct0)):
+            ydl.cookiejar.set_cookie(Cookie(
+                version=0,
+                name=name,
+                value=value,
+                port=None,
+                port_specified=False,
+                domain=domain,
+                domain_specified=True,
+                domain_initial_dot=True,
+                path="/",
+                path_specified=True,
+                secure=True,
+                expires=None,
+                discard=True,
+                comment=None,
+                comment_url=None,
+                rest={"HttpOnly": None},
+                rfc2109=False,
+            ))
+    return True
+
+
+def make_ydl(*, x_authenticated: bool = False):
+    ydl = yt_dlp.YoutubeDL(YDL_OPTS)
+    if x_authenticated:
+        add_x_auth_cookies(ydl, os.getenv("X_AUTH_TOKEN"), os.getenv("X_CT0"))
+    return ydl
+
 def friendly_platform(info: dict) -> str:
     """Turn a yt-dlp extractor key such as `TikTok:user` into `TikTok`."""
     key = (info.get("extractor_key") or info.get("extractor") or "").lower()
@@ -106,7 +160,7 @@ def safe_filename(title: str | None, ext: str | None) -> str:
     return f"{base}.{ext or 'mp4'}"
 
 
-def run_extraction(ydl, url: str) -> dict:
+def run_extraction(ydl, url: str, *, x_authenticated: bool = False) -> dict:
     """Run yt-dlp on an existing session and map its failures to HTTP errors."""
     if not re.match(r"^https?://", url, re.IGNORECASE):
         raise HTTPException(status_code=400, detail="Please enter a valid http(s) URL.")
@@ -116,7 +170,19 @@ def run_extraction(ydl, url: str) -> dict:
     except yt_dlp.utils.DownloadError as exc:
         message = str(exc)
         lowered = message.lower()
-        if "private" in lowered or "login" in lowered or "cookies" in lowered:
+        if is_sensitive_x_error(url, exc) and not x_auth_configured():
+            detail = (
+                "This sensitive X post requires authentication. Configure X_AUTH_TOKEN and "
+                "X_CT0 on the backend, then try again."
+            )
+        elif x_authenticated and (
+            "login" in lowered or "cookies" in lowered or "auth" in lowered
+        ):
+            detail = (
+                "X rejected the configured login session. Refresh X_AUTH_TOKEN and X_CT0 "
+                "on the backend, then try again."
+            )
+        elif "private" in lowered or "login" in lowered or "cookies" in lowered:
             detail = "This post is private or requires a login, so it cannot be fetched."
         elif "unsupported url" in lowered:
             detail = "That link is not supported. Try TikTok, Instagram, Facebook, X or Threads."
@@ -137,8 +203,37 @@ def run_extraction(ydl, url: str) -> dict:
 
 def extract_info(url: str) -> dict:
     """One-shot extraction for callers that do not need the session afterwards."""
-    with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
-        return run_extraction(ydl, url)
+    ydl, info = extract_with_session(url)
+    ydl.close()
+    return info
+
+
+def extract_with_session(url: str):
+    """Extract anonymously, retrying with X cookies only for an explicit NSFW gate."""
+    ydl = make_ydl()
+    try:
+        return ydl, run_extraction(ydl, url)
+    except HTTPException as exc:
+        if not is_sensitive_x_error(url, exc.__cause__ or exc) or not x_auth_configured():
+            ydl.close()
+            raise
+
+    ydl.close()
+    ydl = make_ydl(x_authenticated=True)
+    try:
+        info = run_extraction(ydl, url, x_authenticated=True)
+    except Exception:
+        ydl.close()
+        raise
+
+    entries = info.get("entries") or [info]
+    if not any((entry or {}).get("age_limit") == 18 for entry in entries):
+        ydl.close()
+        raise HTTPException(
+            status_code=403,
+            detail="Authenticated X access is limited to media explicitly marked as sensitive.",
+        )
+    return ydl, info
 
 
 def entries_of(info: dict) -> list[dict]:
@@ -415,9 +510,8 @@ def download(
     extraction (TikTok's `ttwid`, for one), so a hand-rolled request carrying
     only the headers — however correct — still gets a 403.
     """
-    ydl = yt_dlp.YoutubeDL(YDL_OPTS)
+    ydl, info = extract_with_session(url)
     try:
-        info = run_extraction(ydl, url)
         items = entries_of(info)
 
         if index >= len(items):
@@ -542,6 +636,23 @@ def _self_check() -> None:
     assert "filename*=UTF-8''" in header
 
     assert human_size(None) is None
+
+    # Auth must only be considered for an explicit sensitive-content response.
+    assert is_sensitive_x_error(
+        "https://x.com/user/status/1", Exception("NSFW tweet requires authentication")
+    )
+    assert not is_sensitive_x_error("https://x.com/user/status/1", Exception("Protected tweet"))
+    assert not is_sensitive_x_error("https://example.com/1", Exception("NSFW"))
+
+    cookie_ydl = make_ydl()
+    try:
+        assert add_x_auth_cookies(cookie_ydl, "test-auth", "test-csrf")
+        cookies = {(c.domain, c.name): c.value for c in cookie_ydl.cookiejar}
+        assert cookies[(".x.com", "auth_token")] == "test-auth"
+        assert cookies[(".x.com", "ct0")] == "test-csrf"
+    finally:
+        cookie_ydl.close()
+
     print("self-check ok")
 
 
