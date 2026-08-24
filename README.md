@@ -162,10 +162,13 @@ lalu redeploy backend. Ambil nilainya dari DevTools browser (**Application →
 Cookies → https://x.com**) saat akun X sedang login. Jangan commit nilainya ke
 Git atau mengirimkannya melalui chat.
 
+Setelah redeploy, buka URL backend dan pastikan `x_auth.configured` bernilai
+`true`. Nilai cookie tidak pernah ditampilkan oleh endpoint tersebut.
+
 Saveflow hanya memakai sesi tersebut setelah permintaan anonim X secara
-eksplisit ditolak sebagai konten NSFW/sensitif, lalu hasil autentikasi juga
-harus berstatus `age_limit: 18`. Kegagalan karena tweet atau akun privat tidak
-dicoba ulang memakai sesi akun.
+eksplisit meminta autentikasi atau ditolak sebagai konten NSFW/sensitif. Hasil
+autentikasi hanya dikembalikan jika berstatus `age_limit: 18`, sehingga media
+privat biasa tetap ditolak.
 
 #### Vercel (Rekomendasi - Gratis & Tanpa Kartu Kredit)
 
@@ -433,10 +436,13 @@ and redeploy the backend. Copy the values from browser DevTools (**Application
 → Cookies → https://x.com**) while the X account is logged in. Never commit the
 values to Git or send them through chat.
 
+After redeploying, open the backend URL and verify that `x_auth.configured` is
+`true`. The endpoint never exposes the cookie values.
+
 Saveflow only uses this session after an anonymous X request is explicitly
-rejected as NSFW/sensitive, and the authenticated result must also report
-`age_limit: 18`. Private tweet/account failures are never retried with the
-account session.
+asked to authenticate or rejected as NSFW/sensitive. The authenticated result
+is only returned when it reports `age_limit: 18`, so ordinary private media
+remains blocked.
 
 #### Vercel (Recommended - Free & No Credit Card)
 

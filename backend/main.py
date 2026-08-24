@@ -27,6 +27,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from yt_dlp.networking import Request as YdlRequest
 from yt_dlp.networking.exceptions import HTTPError as YdlHTTPError
+from yt_dlp.version import __version__ as YT_DLP_VERSION
 
 app = FastAPI(
     title="Saveflow API",
@@ -85,16 +86,35 @@ def is_x_url(url: str) -> bool:
     return host in ("x.com", "twitter.com") or host.endswith((".x.com", ".twitter.com"))
 
 
-def is_sensitive_x_error(url: str, error: Exception) -> bool:
-    """Only authorize a retry when X explicitly identifies an age/NSFW gate."""
+def is_x_auth_gate(url: str, error: Exception) -> bool:
+    """Retry when X explicitly asks for authentication or an age/NSFW gate."""
     message = str(error).lower()
     return is_x_url(url) and any(marker in message for marker in (
         "nsfw", "sensitive content", "sensitive media", "stated age", "age-restricted",
+        "requires authentication", "login required",
     ))
 
 
+def normalize_cookie_value(value: str | None, cookie_name: str) -> str | None:
+    """Accept a raw DevTools value or a pasted `name=value` pair."""
+    value = (value or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    prefix = f"{cookie_name}="
+    if value.lower().startswith(prefix):
+        value = value[len(prefix):].strip()
+    return value or None
+
+
+def x_cookie_values() -> tuple[str | None, str | None]:
+    return (
+        normalize_cookie_value(os.getenv("X_AUTH_TOKEN"), "auth_token"),
+        normalize_cookie_value(os.getenv("X_CT0"), "ct0"),
+    )
+
+
 def x_auth_configured() -> bool:
-    return bool(os.getenv("X_AUTH_TOKEN") and os.getenv("X_CT0"))
+    return all(x_cookie_values())
 
 
 def add_x_auth_cookies(ydl, auth_token: str | None, ct0: str | None) -> bool:
@@ -129,7 +149,7 @@ def add_x_auth_cookies(ydl, auth_token: str | None, ct0: str | None) -> bool:
 def make_ydl(*, x_authenticated: bool = False):
     ydl = yt_dlp.YoutubeDL(YDL_OPTS)
     if x_authenticated:
-        add_x_auth_cookies(ydl, os.getenv("X_AUTH_TOKEN"), os.getenv("X_CT0"))
+        add_x_auth_cookies(ydl, *x_cookie_values())
     return ydl
 
 def friendly_platform(info: dict) -> str:
@@ -170,9 +190,9 @@ def run_extraction(ydl, url: str, *, x_authenticated: bool = False) -> dict:
     except yt_dlp.utils.DownloadError as exc:
         message = str(exc)
         lowered = message.lower()
-        if is_sensitive_x_error(url, exc) and not x_auth_configured():
+        if is_x_auth_gate(url, exc) and not x_auth_configured():
             detail = (
-                "This sensitive X post requires authentication. Configure X_AUTH_TOKEN and "
+                "This X post requires authentication. Configure X_AUTH_TOKEN and "
                 "X_CT0 on the backend, then try again."
             )
         elif x_authenticated and (
@@ -209,12 +229,12 @@ def extract_info(url: str) -> dict:
 
 
 def extract_with_session(url: str):
-    """Extract anonymously, retrying with X cookies only for an explicit NSFW gate."""
+    """Extract anonymously, retrying with X cookies only for an explicit auth gate."""
     ydl = make_ydl()
     try:
         return ydl, run_extraction(ydl, url)
     except HTTPException as exc:
-        if not is_sensitive_x_error(url, exc.__cause__ or exc) or not x_auth_configured():
+        if not is_x_auth_gate(url, exc.__cause__ or exc) or not x_auth_configured():
             ydl.close()
             raise
 
@@ -457,11 +477,18 @@ def content_disposition(filename: str) -> str:
 @app.get("/")
 def healthcheck():
     """Liveness probe — also what a visitor sees when they open the API URL."""
+    auth_token, ct0 = x_cookie_values()
     return {
         "status": "ok",
         "message": "Saveflow API is running.",
         "docs": "/docs",
         "endpoint": "POST /api/extract",
+        "yt_dlp": YT_DLP_VERSION,
+        "x_auth": {
+            "configured": bool(auth_token and ct0),
+            "auth_token_set": bool(auth_token),
+            "ct0_set": bool(ct0),
+        },
     }
 
 
@@ -637,12 +664,17 @@ def _self_check() -> None:
 
     assert human_size(None) is None
 
-    # Auth must only be considered for an explicit sensitive-content response.
-    assert is_sensitive_x_error(
+    # Auth must only be considered for an explicit X authentication response.
+    assert is_x_auth_gate(
         "https://x.com/user/status/1", Exception("NSFW tweet requires authentication")
     )
-    assert not is_sensitive_x_error("https://x.com/user/status/1", Exception("Protected tweet"))
-    assert not is_sensitive_x_error("https://example.com/1", Exception("NSFW"))
+    assert is_x_auth_gate(
+        "https://x.com/user/status/1", Exception("This post requires authentication")
+    )
+    assert not is_x_auth_gate("https://x.com/user/status/1", Exception("Protected tweet"))
+    assert not is_x_auth_gate("https://example.com/1", Exception("NSFW"))
+    assert normalize_cookie_value(' "auth_token=test-auth" ', "auth_token") == "test-auth"
+    assert normalize_cookie_value("test-csrf", "ct0") == "test-csrf"
 
     cookie_ydl = make_ydl()
     try:
