@@ -494,6 +494,7 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 }
 .format-btn.is-primary { background: var(--grad); border-color: transparent; color: #fff; }
 .format-btn small { color: inherit; opacity: .7; font-size: 12px; }
+.preview-only { color: var(--text-muted); font-size: 13px; }
 
 /* -------------------------------------------------------------------------
    Generic sections

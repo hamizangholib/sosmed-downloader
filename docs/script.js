@@ -128,17 +128,20 @@ function renderCard(item, platform, index, total, sourceUrl) {
 
   const duration = formatDuration(item.duration);
   const slideLabel = total > 1 ? `<span class="tag tag-muted">Item ${index + 1} of ${total}</span>` : "";
+  const thumbnailUrl = item.thumbnail_proxy
+    ? `${API_ROOT}/api/thumbnail?url=${encodeURIComponent(sourceUrl)}&index=${encodeURIComponent(item.index ?? 0)}`
+    : item.thumbnail;
 
-  const thumb = item.thumbnail
+  const thumb = thumbnailUrl
     ? `<div class="result-thumb">
-         <img src="${escapeHtml(item.thumbnail)}" alt="" loading="lazy"
+         <img src="${escapeHtml(thumbnailUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer"
               onerror="this.parentElement.classList.add('is-empty'); this.remove();" />
          ${duration ? `<span class="result-duration">${duration}</span>` : ""}
        </div>`
     : `<div class="result-thumb is-empty">No preview</div>`;
 
-  const formats = item.formats
-    .map((fmt, i) => {
+  const formats = item.formats.length
+    ? item.formats.map((fmt, i) => {
       const size = fmt.filesize ? `<small>${escapeHtml(fmt.filesize)}</small>` : "";
       const icon = { audio: "♪", image: "▣", stream: "≋" }[fmt.kind] || "↓";
       // Point at our own endpoint rather than the CDN link. It re-resolves the
@@ -155,8 +158,8 @@ function renderCard(item, platform, index, total, sourceUrl) {
                 <span aria-hidden="true">${icon}</span>
                 ${escapeHtml(fmt.label)} · ${escapeHtml(fmt.ext)} ${size}
               </a>`;
-    })
-    .join("");
+      }).join("")
+    : `<p class="preview-only">Preview available, but this source blocked direct download from the server.</p>`;
 
   card.innerHTML = `
     ${thumb}
