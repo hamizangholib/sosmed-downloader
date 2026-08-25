@@ -1,5 +1,5 @@
 # Saveflow backend — built for Hugging Face Spaces (Docker Space).
-FROM python:3.10-slim
+FROM python:3.12-slim
 
 # ffmpeg: required by yt-dlp for muxing/probing.
 # curl:   used by the container healthcheck below.

@@ -399,7 +399,8 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 
 .folder-panel,
 .media-results,
-.page-preview-panel {
+.page-preview-panel,
+.helper-panel {
   display: grid;
   gap: 16px;
 }
@@ -490,7 +491,8 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .page-preview-heading { justify-content: space-between; }
 .page-preview-heading h3 { margin-top: 7px; font-size: 18px; font-weight: 500; }
 .page-preview-actions a,
-.page-rescan {
+.page-rescan,
+.page-helper {
   padding: 9px 13px;
   color: var(--text);
   background: var(--surface-2);
@@ -498,7 +500,13 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   border-radius: 10px;
   cursor: pointer;
 }
+.page-helper {
+  background: var(--grad);
+  border-color: transparent;
+}
 .page-preview-note { color: var(--text-muted); font-size: 14px; }
+.helper-state { color: var(--accent-soft); }
+.helper-state a { text-decoration: underline; text-underline-offset: 3px; }
 .page-preview-panel iframe {
   width: 100%;
   min-height: 520px;
@@ -506,6 +514,20 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   border: 1px solid var(--border);
   border-radius: 12px;
 }
+
+.helper-panel {
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  padding: 20px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+.helper-panel h3 { margin-top: 7px; font-size: 18px; }
+.helper-panel p { margin-top: 7px; color: var(--text-muted); font-size: 14px; }
+.helper-panel small { grid-column: 1 / -1; color: var(--text-muted); }
+.helper-waiting { grid-template-columns: 1fr; border-color: rgba(75, 142, 241, .5); }
 
 .result-card {
   display: flex;
@@ -598,6 +620,8 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   border-radius: var(--radius-pill);
   color: var(--text);
   font-size: 13.5px;
+  font-family: inherit;
+  cursor: pointer;
   transition: border-color .25s, transform .25s, background .25s;
 }
 .format-btn:hover {
@@ -752,6 +776,8 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   .result-card { flex-direction: column; }
   .result-thumb { width: 100%; }
   .page-preview-heading { align-items: flex-start; flex-direction: column; }
+  .page-preview-actions { flex-wrap: wrap; }
+  .helper-panel { grid-template-columns: 1fr; }
   .page-preview-panel iframe { min-height: 420px; }
 }
 

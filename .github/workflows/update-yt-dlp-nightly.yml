@@ -1,0 +1,58 @@
+name: Update yt-dlp nightly
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-yt-dlp-nightly
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Resolve latest nightly
+        id: nightly
+        shell: bash
+        run: |
+          python -m pip install --upgrade --pre "yt-dlp[default,curl-cffi]"
+          version="$(python -c 'from importlib.metadata import version; print(version("yt-dlp"))')"
+          python scripts/update_yt_dlp_requirement.py backend/requirements.txt "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install pinned backend
+        run: python -m pip install --upgrade -r backend/requirements.txt
+
+      - name: Verify updater and backend
+        run: |
+          python scripts/update_yt_dlp_requirement.py --self-check
+          python backend/main.py
+
+      - name: Verify helper JavaScript
+        run: node --test browser-extension/tests/shared.test.js
+
+      - name: Commit a verified update
+        shell: bash
+        run: |
+          if git diff --quiet -- backend/requirements.txt; then
+            echo "yt-dlp is already current."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/requirements.txt
+          git commit -m "chore(deps): update yt-dlp nightly"
+          git push

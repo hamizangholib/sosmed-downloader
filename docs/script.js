@@ -27,6 +27,7 @@ const API_BASE_URL = ["localhost", "127.0.0.1"].includes(location.hostname)
 // A trailing slash here would produce `...app//api/extract`, which is a
 // different route and 404s. Strip it once so either spelling works.
 const API_ROOT = API_BASE_URL.replace(/\/+$/, "");
+const HELPER_INSTALL_URL = "https://github.com/hamizangholib/sosmed-downloader/tree/main/browser-extension";
 
 // ---- Element handles -------------------------------------------------------
 const form = document.getElementById("downloadForm");
@@ -41,6 +42,8 @@ const errorClose = document.getElementById("errorClose");
 const header = document.getElementById("siteHeader");
 const nav = document.getElementById("siteNav");
 const navToggle = document.getElementById("navToggle");
+let helperReady = false;
+let helperSessionUrl = null;
 
 // ---- Small helpers ---------------------------------------------------------
 
@@ -64,10 +67,12 @@ function escapeHtml(value) {
 
 /** Turn a title into a safe-ish filename for the download attribute. */
 function toFilename(title, ext) {
-  const base = String(title || "saveflow")
+  let base = String(title || "saveflow")
     .replace(/[\\/:*?"<>|\n\r]+/g, " ")
     .trim()
     .slice(0, 80) || "saveflow";
+  const suffix = `.${ext || "mp4"}`;
+  if (base.toLowerCase().endsWith(suffix.toLowerCase())) base = base.slice(0, -suffix.length);
   return `${base}.${ext || "mp4"}`;
 }
 
@@ -79,6 +84,94 @@ function showError(message) {
 function clearError() {
   errorAlert.hidden = true;
 }
+
+function postToHelper(type, payload = {}) {
+  window.postMessage({ source: "saveflow-web", type, ...payload }, location.origin);
+}
+
+function mediaExtension(url, kind) {
+  const allowed = {
+    image: new Set(["avif", "bmp", "gif", "heic", "jpeg", "jpg", "png", "svg", "tif", "tiff", "webp"]),
+    stream: new Set(["m3u8"]),
+    video: new Set(["avi", "m4v", "mkv", "mov", "mp4", "webm"]),
+  };
+  try {
+    const file = new URL(url).pathname.split("/").pop() || "";
+    const ext = file.includes(".") ? file.split(".").pop().toLowerCase() : "";
+    if (allowed[kind]?.has(ext)) return ext;
+  } catch {
+    // Use a sensible display fallback below.
+  }
+  return kind === "image" ? "jpg" : kind === "stream" ? "m3u8" : "mp4";
+}
+
+function helperData(message) {
+  const candidates = (message.candidates || []).flatMap((candidate, index) => {
+    try {
+      const url = new URL(candidate.url);
+      if (!/^https?:$/.test(url.protocol)) return [];
+      const kind = ["image", "stream", "video"].includes(candidate.kind)
+        ? candidate.kind
+        : "video";
+      const ext = mediaExtension(url.href, kind);
+      const pathName = decodeURIComponent(url.pathname.split("/").pop() || "");
+      const title = pathName || `Detected ${kind} ${index + 1}`;
+      return [{
+        index,
+        helper: true,
+        title,
+        uploader: url.hostname,
+        duration: null,
+        thumbnail: kind === "image" ? url.href : candidate.thumbnail,
+        thumbnail_proxy: false,
+        formats: [{
+          format_id: `helper-${index}`,
+          label: kind === "image" ? "Original image" : kind === "stream" ? "HLS stream" : "Detected video",
+          ext,
+          kind,
+          direct_url: url.href,
+        }],
+      }];
+    } catch {
+      return [];
+    }
+  });
+  return {
+    platform: "Browser helper",
+    source_url: message.pageUrl || message.sourceUrl,
+    title: message.title || "Detected media",
+    items: candidates,
+    folders: [],
+  };
+}
+
+window.addEventListener("message", (event) => {
+  if (event.source !== window || event.origin !== location.origin || event.data?.source !== "saveflow-helper") return;
+  if (event.data.type === "SAVEFLOW_HELPER_READY") {
+    helperReady = true;
+    document.querySelectorAll(".helper-state").forEach((node) => {
+      node.textContent = "Helper ready";
+    });
+    return;
+  }
+  if (event.data.type === "SAVEFLOW_HELPER_ERROR") {
+    showError(event.data.error || "Saveflow Helper could not complete that action.");
+    return;
+  }
+  if (event.data.type === "SAVEFLOW_HELPER_RESULTS") {
+    const data = helperData(event.data);
+    if (data.items.length) {
+      clearError();
+      renderResults(data, event.data.sourceUrl || helperSessionUrl);
+    } else {
+      const count = document.querySelector(".helper-waiting-count");
+      if (count) count.textContent = "No media yet — click or play something in the source tab.";
+    }
+  }
+});
+
+postToHelper("SAVEFLOW_HELPER_PING");
+setTimeout(() => postToHelper("SAVEFLOW_HELPER_PING"), 800);
 
 const loadingNote = loadingState.querySelector(".skeleton-note");
 const DEFAULT_NOTE = loadingNote.textContent;
@@ -142,17 +235,18 @@ function renderCard(item, formats, platform, index, total, sourceUrl) {
   const previewFormat = formats.find((fmt) => fmt.kind === "image") ||
     formats.find((fmt) => fmt.kind === "video");
 
+  const directPreview = previewFormat?.direct_url;
   const thumb = thumbnailUrl
     ? `<div class="result-thumb">
          <img src="${escapeHtml(thumbnailUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer"
-              data-fallback-thumbnail="${escapeHtml(item.thumbnail_proxy ? "" : proxiedThumbnail)}" />
+              data-fallback-thumbnail="${escapeHtml(item.helper || item.thumbnail_proxy ? "" : proxiedThumbnail)}" />
          ${duration ? `<span class="result-duration">${duration}</span>` : ""}
        </div>`
-    : previewFormat
+    : previewFormat && previewFormat.kind !== "stream"
       ? `<div class="result-thumb">
            ${previewFormat.kind === "image"
-             ? `<img src="${escapeHtml(downloadUrl(sourceUrl, item, previewFormat))}" alt="" loading="lazy" />`
-             : `<video src="${escapeHtml(downloadUrl(sourceUrl, item, previewFormat))}" controls muted preload="metadata" playsinline></video>`}
+             ? `<img src="${escapeHtml(directPreview || downloadUrl(sourceUrl, item, previewFormat))}" alt="" loading="lazy" referrerpolicy="no-referrer" />`
+             : `<video src="${escapeHtml(directPreview || downloadUrl(sourceUrl, item, previewFormat))}" controls muted preload="metadata" playsinline></video>`}
            ${duration ? `<span class="result-duration">${duration}</span>` : ""}
          </div>`
     : `<div class="result-thumb is-empty">No preview</div>`;
@@ -161,6 +255,14 @@ function renderCard(item, formats, platform, index, total, sourceUrl) {
     ? formats.map((fmt, i) => {
       const size = fmt.filesize ? `<small>${escapeHtml(fmt.filesize)}</small>` : "";
       const icon = { audio: "♪", image: "▣", stream: "≋" }[fmt.kind] || "↓";
+      if (fmt.direct_url) {
+        return `<button type="button" class="format-btn helper-download ${i === 0 ? "is-primary" : ""}"
+                  data-helper-url="${escapeHtml(fmt.direct_url)}"
+                  data-helper-filename="${escapeHtml(toFilename(item.title, fmt.ext))}">
+                  <span aria-hidden="true">${icon}</span>
+                  ${escapeHtml(fmt.label)} · ${escapeHtml(fmt.ext)} ${size}
+                </button>`;
+      }
       const href = downloadUrl(sourceUrl, item, fmt);
       return `<a class="format-btn ${i === 0 ? "is-primary" : ""}"
                  href="${escapeHtml(href)}"
@@ -235,15 +337,47 @@ function renderPagePreview(preview) {
         <h3>${escapeHtml(preview.title || "No direct media detected")}</h3>
       </div>
       <div class="page-preview-actions">
+        <button type="button" class="page-helper" data-helper-url="${escapeHtml(preview.url)}">Detect from browser tab</button>
         <button type="button" class="page-rescan" data-rescan-url="${escapeHtml(preview.url)}">Scan again</button>
         <a href="${escapeHtml(preview.url)}" target="_blank" rel="noopener noreferrer">Open source ↗</a>
       </div>
     </div>
-    <p class="page-preview-note">No downloadable file was exposed yet. You can interact with the page below. If it opens a different address, paste that new address into Saveflow.</p>
+    <p class="page-preview-note">No downloadable file was exposed yet. Use the browser helper to open the source, interact with it, and return detected media automatically. <span class="helper-state">${helperReady ? "Helper ready" : `Helper not detected · <a href="${HELPER_INSTALL_URL}" target="_blank" rel="noopener noreferrer">setup</a>`}</span>.</p>
     <iframe src="${escapeHtml(preview.url)}" title="${escapeHtml(preview.title || "Source page")}"
             sandbox="allow-scripts allow-presentation" allow="autoplay; fullscreen"
             loading="lazy" referrerpolicy="no-referrer"></iframe>`;
   return section;
+}
+
+function renderHelperFallback(url, reason) {
+  const section = document.createElement("section");
+  section.className = "helper-panel";
+  section.innerHTML = `
+    <div>
+      <span class="tag">Browser fallback</span>
+      <h3>Try interactive detection</h3>
+      <p>${escapeHtml(reason || "The server did not expose media from this page.")}</p>
+    </div>
+    <button type="button" class="page-helper" data-helper-url="${escapeHtml(url)}">Detect from browser tab</button>
+    <small class="helper-state">${helperReady ? "Helper ready" : `Helper not detected · <a href="${HELPER_INSTALL_URL}" target="_blank" rel="noopener noreferrer">setup instructions</a>`}</small>`;
+  results.innerHTML = "";
+  results.appendChild(section);
+  results.hidden = false;
+}
+
+function renderHelperWaiting(url) {
+  helperSessionUrl = url;
+  const section = document.createElement("section");
+  section.className = "helper-panel helper-waiting";
+  section.innerHTML = `
+    <div>
+      <span class="tag">Browser helper</span>
+      <h3>Interact with the source tab</h3>
+      <p class="helper-waiting-count">Waiting for media. Press play, open a folder, or click the content you want.</p>
+    </div>`;
+  results.innerHTML = "";
+  results.appendChild(section);
+  results.hidden = false;
 }
 
 function renderMedia(data, sourceUrl) {
@@ -315,6 +449,34 @@ function renderResults(data, requestedUrl) {
 // look ignored. There is no completion event for a plain navigation download,
 // so the label simply reverts on a timer.
 results.addEventListener("click", async (event) => {
+  const helper = event.target.closest(".page-helper");
+  if (helper) {
+    if (!helperReady) {
+      showError("Saveflow Helper is not installed. Load the browser-extension folder from chrome://extensions or edge://extensions first.");
+      return;
+    }
+    clearError();
+    renderHelperWaiting(helper.dataset.helperUrl);
+    postToHelper("SAVEFLOW_HELPER_OPEN", { url: helper.dataset.helperUrl });
+    return;
+  }
+
+  const helperDownload = event.target.closest(".helper-download");
+  if (helperDownload) {
+    const original = helperDownload.innerHTML;
+    helperDownload.disabled = true;
+    helperDownload.innerHTML = '<span aria-hidden="true">⏳</span> Starting…';
+    postToHelper("SAVEFLOW_HELPER_DOWNLOAD", {
+      url: helperDownload.dataset.helperUrl,
+      filename: helperDownload.dataset.helperFilename,
+    });
+    setTimeout(() => {
+      helperDownload.innerHTML = original;
+      helperDownload.disabled = false;
+    }, 2500);
+    return;
+  }
+
   const rescan = event.target.closest(".page-rescan");
   if (rescan) {
     await loadMedia(rescan.dataset.rescanUrl);
@@ -373,6 +535,7 @@ async function loadMedia(url) {
       ? "Could not reach the Saveflow API. Check that the backend is running and API_BASE_URL is correct."
       : err.message;
     showError(message);
+    renderHelperFallback(url, message);
   } finally {
     setLoading(false);
   }

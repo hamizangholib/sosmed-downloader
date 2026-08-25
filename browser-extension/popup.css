@@ -1,0 +1,8 @@
+:root { color-scheme: dark; font-family: system-ui, sans-serif; }
+body { width: 320px; margin: 0; background: #0c1017; color: #eef2f8; }
+main { padding: 18px; }
+h1 { margin: 0 0 8px; font-size: 18px; }
+p { margin: 0; color: #94a2b8; line-height: 1.45; }
+ul { margin: 14px 0; padding: 0; list-style: none; display: grid; gap: 7px; }
+li { padding: 8px 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: #1b2331; border-radius: 8px; }
+button { width: 100%; padding: 10px; color: white; background: #4b8ef1; border: 0; border-radius: 999px; cursor: pointer; }

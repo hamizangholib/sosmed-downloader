@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python"></a>
+  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.12-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python"></a>
   <a href="https://fastapi.tiangolo.com/"><img src="https://img.shields.io/badge/FastAPI-0.115+-009688?style=for-the-badge&logo=fastapi&logoColor=white" alt="FastAPI"></a>
   <a href="https://github.com/yt-dlp/yt-dlp"><img src="https://img.shields.io/badge/yt--dlp-2025.1+-FF0000?style=for-the-badge&logo=youtube&logoColor=white" alt="yt-dlp"></a>
   <a href="https://docker.com"><img src="https://img.shields.io/badge/Docker-Supported-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker"></a>
@@ -31,7 +31,7 @@
 
 Saveflow adalah aplikasi pengunduh media media sosial serbaguna yang cepat, tanpa watermark, dan tanpa perlu login. Aplikasi ini mengonversi tautan dari **TikTok, Instagram, Facebook, X (Twitter), dan Threads** menjadi tautan unduhan langsung untuk video, foto, maupun audio.
 
-- **Backend**: Python 3.10 + FastAPI + `yt-dlp`, dikontainerisasi dengan Docker dan siap dideploy ke Vercel, Render, Cloud Run, atau server Anda sendiri.
+- **Backend**: Python 3.12 + FastAPI + `yt-dlp`, dikontainerisasi dengan Docker dan siap dideploy ke Vercel, Render, Cloud Run, atau server Anda sendiri.
 - **Frontend**: Responsive UI berbasis HTML/CSS/Vanilla JS modern yang dirancang untuk dihosting secara gratis melalui **GitHub Pages**.
 
 ---
@@ -85,12 +85,13 @@ Saveflow adalah aplikasi pengunduh media media sosial serbaguna yang cepat, tanp
 ├── backend/
 │   ├── main.py            # FastAPI app: GET /, POST /api/extract, GET /api/download
 │   ├── requirements.txt   # FastAPI, uvicorn, yt-dlp, pydantic
-│   └── Dockerfile         # Docker build (Python 3.10 slim + ffmpeg)
+│   └── Dockerfile         # Docker build (Python 3.12 slim + ffmpeg)
 ├── docs/                  # Frontend statis yang dipublikasikan oleh GitHub Pages
 │   ├── index.html         # Struktur UI aplikasi
 │   ├── style.css          # Styling kustom (Design System & Responstivitas)
 │   ├── script.js          # Logika frontend & integrasi API
 │   └── assets/            # Logo & aset visual
+├── browser-extension/     # Helper Chromium opsional untuk media interaktif
 └── README.md              # Dokumentasi proyek
 ```
 
@@ -100,7 +101,7 @@ Saveflow adalah aplikasi pengunduh media media sosial serbaguna yang cepat, tanp
 
 #### 1. Menggunakan Python venv
 
-**Prasyarat**: Python 3.10+ dipasang di sistem.
+**Prasyarat**: Python 3.12 dipasang di sistem.
 
 1. Masuk ke direktori `backend`:
    ```bash
@@ -306,7 +307,7 @@ GET /api/download?url=<URL_ASLI_POSTINGAN>&index=0&format_id=<FORMAT_ID>
 
 Saveflow is a lightweight, fast, and modern social media media downloader. Paste a link from **TikTok, Instagram, Facebook, X (Twitter), or Threads** and instantly receive direct download links for videos, photos, or audio without any watermark or account sign-up.
 
-- **Backend**: Python 3.10 + FastAPI + `yt-dlp`, containerized via Docker and ready for deployment to Vercel, Render, Cloud Run, or custom servers.
+- **Backend**: Python 3.12 + FastAPI + `yt-dlp`, containerized via Docker and ready for deployment to Vercel, Render, Cloud Run, or custom servers.
 - **Frontend**: Clean Vanilla HTML5/CSS3/JS UI designed to be hosted for free on **GitHub Pages**.
 
 ---
@@ -360,12 +361,13 @@ Saveflow is a lightweight, fast, and modern social media media downloader. Paste
 ├── backend/
 │   ├── main.py            # FastAPI app: GET /, POST /api/extract, GET /api/download
 │   ├── requirements.txt   # Dependencies: FastAPI, uvicorn, yt-dlp, pydantic
-│   └── Dockerfile         # Docker image configuration (Python 3.10 slim + ffmpeg)
+│   └── Dockerfile         # Docker image configuration (Python 3.12 slim + ffmpeg)
 ├── docs/                  # Static web app published by GitHub Pages
 │   ├── index.html         # Main Web Interface
 │   ├── style.css          # Design system & responsive styles
 │   ├── script.js          # API client & UI event handling
 │   └── assets/            # Logos & SVG graphics
+├── browser-extension/     # Optional Chromium helper for interactive media
 └── README.md              # Project documentation
 ```
 
@@ -375,7 +377,7 @@ Saveflow is a lightweight, fast, and modern social media media downloader. Paste
 
 #### 1. Using Python venv
 
-**Prerequisite**: Python 3.10+ installed on your machine.
+**Prerequisite**: Python 3.12 installed on your machine.
 
 1. Navigate to the `backend` directory:
    ```bash
