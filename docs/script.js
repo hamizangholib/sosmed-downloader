@@ -159,7 +159,7 @@ function renderCard(item, platform, index, total, sourceUrl) {
                 ${escapeHtml(fmt.label)} · ${escapeHtml(fmt.ext)} ${size}
               </a>`;
       }).join("")
-    : `<p class="preview-only">Preview available, but this source blocked direct download from the server.</p>`;
+    : `<p class="preview-only">${escapeHtml(item.warning || "Preview available, but this source blocked direct download from the server.")}</p>`;
 
   card.innerHTML = `
     ${thumb}

@@ -70,6 +70,13 @@ YDL_OPTS = {
     "noplaylist": False,  # Instagram carousels arrive as a playlist of entries.
     "extract_flat": False,
     "socket_timeout": 30,
+    # YouTube now serves JavaScript challenges that yt-dlp must solve. Vercel's
+    # runtime includes Node; the matching EJS scripts come from yt-dlp[default].
+    "js_runtimes": {"node": {}},
+    # mweb still exposes a progressive MP4 for public videos. Without it, the
+    # default client may return only separate video/audio tracks that this
+    # streaming API cannot merge without writing a large temporary file.
+    "extractor_args": {"youtube": {"player_client": ["mweb", "default"]}},
 }
 
 # Adaptive streaming protocols. A browser cannot save these as one file without
@@ -733,9 +740,18 @@ def validate_proxy_url(proxy: str) -> str:
     return proxy
 
 
+def is_youtube_url(url: str | None) -> bool:
+    host = (urlsplit(url or "").hostname or "").lower().removeprefix("www.")
+    return host in ("youtube.com", "youtu.be", "music.youtube.com")
+
+
+def media_proxy_target(url: str | None) -> bool:
+    return bool(url and (preview_reader_target(url) or is_youtube_url(url)))
+
+
 def media_proxy_urls(url: str | None) -> list[str]:
     """Build the ordered proxy list for sites that need alternate outbound IPs."""
-    if not url or not preview_reader_target(url):
+    if not media_proxy_target(url):
         return []
 
     proxies = [
@@ -757,6 +773,11 @@ def media_proxy_urls(url: str | None) -> list[str]:
     if bool(username) != bool(password):
         raise RuntimeError(
             "MEDIA_PROXY_USERNAME and MEDIA_PROXY_PASSWORD must be set together."
+        )
+    if servers and not username:
+        raise RuntimeError(
+            "MEDIA_PROXY_SERVERS requires MEDIA_PROXY_USERNAME and "
+            "MEDIA_PROXY_PASSWORD. Use MEDIA_PROXY_URLS for proxies that do not need login."
         )
     auth = f"{quote(username, safe='')}:{quote(password, safe='')}@" if username else ""
     proxies.extend(f"http://{auth}{server}" for server in servers)
@@ -853,6 +874,14 @@ def run_extraction(
                 "X rejected the configured login session. Refresh X_AUTH_TOKEN and X_CT0 "
                 "on the backend, then try again."
             )
+        elif is_youtube_url(url) and any(marker in lowered for marker in (
+            "confirm you're not a bot", "confirm you’re not a bot", "sign in to confirm",
+            "player response", "po token",
+        )):
+            detail = (
+                "YouTube rejected this server or proxy as automated traffic. "
+                "Check the media proxy credentials or replace the blocked proxy."
+            )
         elif "private" in lowered or "login" in lowered or "cookies" in lowered:
             detail = "This post is private or requires a login, so it cannot be fetched."
         elif "unsupported url" in lowered:
@@ -884,7 +913,10 @@ def extract_with_session(url: str):
     # Streamrizz's current media CDN has an expired certificate. Keep the bypass
     # scoped to this one integration instead of weakening every platform.
     streamrizz = bool(is_streamrizz_url(url) or streamrizz_folder_id(url))
-    proxies = media_proxy_urls(url)
+    try:
+        proxies = media_proxy_urls(url)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     if proxies:
         last_error = None
         for proxy in proxies:
@@ -906,7 +938,12 @@ def extract_with_session(url: str):
 
         ydl = make_ydl()
         try:
-            return ydl, extract_preview_only(ydl, url)
+            info = extract_preview_only(ydl, url)
+            info["_media_warning"] = (
+                f"Preview only: all {len(proxies)} configured media proxies failed. "
+                "Check their login credentials, quota, and allowed destination sites."
+            )
+            return ydl, info
         except Exception:
             ydl.close()
             raise last_error
@@ -1021,14 +1058,15 @@ def build_formats(info: dict) -> list[dict]:
 
         height = fmt.get("height")
         label = f"{height}p" if height else (fmt.get("format_note") or "Video")
+        progressive = fmt.get("acodec") not in (None, "none")
         candidate = {
             "format_id": str(fmt.get("format_id") or ""),
             "url": fmt["url"],
-            "label": label,
+            "label": label if progressive else f"{label} · video only",
             "ext": fmt.get("ext") or "mp4",
             "filesize": human_size(fmt.get("filesize") or fmt.get("filesize_approx")),
             "kind": "video",
-            "_progressive": fmt.get("acodec") not in (None, "none"),
+            "_progressive": progressive,
             "_height": height or 0,
             "_tbr": fmt.get("tbr") or 0,
         }
@@ -1043,7 +1081,13 @@ def build_formats(info: dict) -> list[dict]:
         ):
             best_by_label[label] = candidate
 
-    ordered = sorted(best_by_label.values(), key=lambda f: f["_height"], reverse=True)
+    # A complete video+audio file is useful immediately; make it the primary
+    # button even when a taller video-only track also exists.
+    ordered = sorted(
+        best_by_label.values(),
+        key=lambda f: (f["_progressive"], f["_height"]),
+        reverse=True,
+    )
     result = [{k: v for k, v in fmt.items() if not k.startswith("_")} for fmt in ordered[:6]]
 
     for img in images[:6]:
@@ -1100,6 +1144,7 @@ def build_item(info: dict, index: int) -> dict:
         "thumbnail_proxy": bool(info.get("_thumbnail_proxy")),
         "duration": info.get("duration"),
         "uploader": info.get("uploader") or info.get("channel") or info.get("uploader_id"),
+        "warning": info.get("_media_warning"),
         "formats": build_formats(info),
     }
 
@@ -1157,6 +1202,21 @@ def content_disposition(filename: str) -> str:
 def healthcheck():
     """Liveness probe — also what a visitor sees when they open the API URL."""
     auth_token, ct0 = x_cookie_values()
+    proxy_urls = [
+        value.strip()
+        for value in re.split(
+            r"[\r\n,]+",
+            os.getenv("MEDIA_PROXY_URLS", "") or os.getenv("MEDIA_PROXY_URL", ""),
+        )
+        if value.strip()
+    ]
+    proxy_servers = [
+        value.strip()
+        for value in re.split(r"[\r\n,]+", os.getenv("MEDIA_PROXY_SERVERS", ""))
+        if value.strip()
+    ]
+    proxy_username = bool(os.getenv("MEDIA_PROXY_USERNAME", "").strip())
+    proxy_password = bool(os.getenv("MEDIA_PROXY_PASSWORD", "").strip())
     return {
         "status": "ok",
         "message": "Saveflow API is running.",
@@ -1167,6 +1227,13 @@ def healthcheck():
             "configured": bool(auth_token and ct0),
             "auth_token_set": bool(auth_token),
             "ct0_set": bool(ct0),
+        },
+        "media_proxy": {
+            "configured": bool(proxy_urls or proxy_servers)
+            and (not proxy_servers or (proxy_username and proxy_password)),
+            "proxy_count": len(proxy_urls) + len(proxy_servers),
+            "username_set": proxy_username,
+            "password_set": proxy_password,
         },
     }
 
@@ -1369,6 +1436,8 @@ def _self_check() -> None:
              "acodec": "mp4a", "tbr": 3000, "ext": "mp4"},
             {"format_id": "v3", "url": "c", "height": 720, "vcodec": "h264",
              "acodec": "mp4a", "tbr": 1500, "ext": "mp4", "filesize": 8_400_000},
+            {"format_id": "v4", "url": "f", "height": 2160, "vcodec": "h264",
+             "acodec": "none", "tbr": 12000, "ext": "mp4"},
             # Adaptive stream: held back while progressive formats exist.
             {"format_id": "hls", "url": "d", "height": 480, "vcodec": "h264",
              "acodec": "mp4a", "protocol": "m3u8_native"},
@@ -1377,7 +1446,9 @@ def _self_check() -> None:
         ],
     }
     fmts = build_formats(video_info)
-    assert [f["label"] for f in fmts] == ["1080p", "720p", "Audio only"], fmts
+    assert [f["label"] for f in fmts] == [
+        "1080p", "720p", "2160p · video only", "Audio only",
+    ], fmts
     assert fmts[0]["url"] == "b", "progressive stream should beat video-only at 1080p"
     assert fmts[0]["format_id"] == "v2"
     assert fmts[1]["filesize"] == "8.0 MB", fmts[1]["filesize"]
@@ -1528,10 +1599,15 @@ def _self_check() -> None:
         assert media_proxy_urls(
             "https://www.pornhub.com/view_video.php?viewkey=abc123"
         ) == expected_proxies
-        assert media_proxy_urls("https://www.youtube.com/watch?v=abc123") == []
-        os.environ.pop("MEDIA_PROXY_SERVERS")
+        assert media_proxy_urls("https://www.youtube.com/watch?v=abc123") == expected_proxies
         os.environ.pop("MEDIA_PROXY_USERNAME")
         os.environ.pop("MEDIA_PROXY_PASSWORD")
+        try:
+            media_proxy_urls("https://www.xnxx.com/video-abc/sample")
+            raise AssertionError("server lists without credentials must be rejected")
+        except RuntimeError as exc:
+            assert "requires MEDIA_PROXY_USERNAME" in str(exc)
+        os.environ.pop("MEDIA_PROXY_SERVERS")
         os.environ["MEDIA_PROXY_URLS"] = (
             "http://proxy-a.example:8080\nhttp://proxy-a.example:8080,"
             "socks5://proxy-b.example:1080"

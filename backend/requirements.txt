@@ -1,4 +1,4 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
-yt-dlp[curl-cffi]==2026.8.19
+yt-dlp[default,curl-cffi]==2026.8.19
 pydantic==2.10.4
