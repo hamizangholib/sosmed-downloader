@@ -6,6 +6,7 @@ const MAX_CANDIDATES = 250;
 const SAVEFLOW_HOSTS = new Set([
   "download.xsaintz.my.id",
   "hamizangholib.github.io",
+  "xsaintz.github.io",
   "localhost",
   "127.0.0.1",
 ]);

@@ -27,7 +27,7 @@ const API_BASE_URL = ["localhost", "127.0.0.1"].includes(location.hostname)
 // A trailing slash here would produce `...app//api/extract`, which is a
 // different route and 404s. Strip it once so either spelling works.
 const API_ROOT = API_BASE_URL.replace(/\/+$/, "");
-const HELPER_INSTALL_URL = "https://github.com/hamizangholib/sosmed-downloader/tree/main/browser-extension";
+const HELPER_INSTALL_URL = "https://github.com/xsaintz/sosmed-downloader/tree/main/browser-extension";
 
 // ---- Element handles -------------------------------------------------------
 const form = document.getElementById("downloadForm");
