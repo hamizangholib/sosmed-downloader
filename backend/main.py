@@ -94,6 +94,8 @@ VIDEO_EXTS = ("mp4", "webm", "mov", "m4v", "mkv", "avi", "m3u8")
 
 CHUNK_SIZE = 64 * 1024
 MAX_HTML_BYTES = 2_000_000
+MAX_STREAMRIZZ_FOLDER_PAGES = 25
+MAX_STREAMRIZZ_FOLDER_ENTRIES = 500
 
 
 class ExtractRequest(BaseModel):
@@ -174,6 +176,7 @@ class StreamrizzFolderParser(HTMLParser):
         self.title_parts: list[str] = []
         self.entries: list[dict] = []
         self.folders: list[dict] = []
+        self.page_urls: list[str] = []
         self.parent_url: str | None = None
         self._in_title = False
         self._in_name = False
@@ -190,6 +193,8 @@ class StreamrizzFolderParser(HTMLParser):
             self._in_title = True
         elif tag == "a" and "back-btn" in classes and values.get("href"):
             self.parent_url = values["href"]
+        elif tag == "a" and "page-btn" in classes and values.get("href"):
+            self.page_urls.append(values["href"])
         elif tag == "a" and "folder-chip" in classes and values.get("href"):
             self._in_folder = True
             self._folder_parts = []
@@ -445,6 +450,23 @@ def streamrizz_folder_id(url: str) -> str | None:
         return None
     match = re.fullmatch(r"/f/([A-Za-z0-9_-]+)/?", parts.path)
     return match.group(1) if match else None
+
+
+def streamrizz_folder_page_numbers(folder_url: str, page_urls: list[str]) -> list[int]:
+    """Return the bounded page range advertised by one Streamrizz folder page."""
+    folder_id = streamrizz_folder_id(folder_url)
+    numbers = {1}
+    for raw_url in page_urls:
+        page_url = urljoin(folder_url, raw_url)
+        if streamrizz_folder_id(page_url) != folder_id:
+            continue
+        values = parse_qs(urlsplit(page_url).query).get("p", [])
+        if len(values) != 1 or not values[0].isdigit():
+            continue
+        number = int(values[0])
+        if 1 <= number <= MAX_STREAMRIZZ_FOLDER_PAGES:
+            numbers.add(number)
+    return list(range(1, min(max(numbers), MAX_STREAMRIZZ_FOLDER_PAGES) + 1))
 
 
 def videeyss_id(url: str) -> str | None:
@@ -738,10 +760,18 @@ def extract_streamrizz_folder(ydl, url: str) -> dict:
     parser = StreamrizzFolderParser()
     parser.feed(read_page(ydl, folder_url, url))
 
+    parsers = [parser]
+    for page_number in streamrizz_folder_page_numbers(folder_url, parser.page_urls)[1:]:
+        page_parser = StreamrizzFolderParser()
+        page_parser.feed(read_page(ydl, f"{folder_url}?p={page_number}", folder_url))
+        parsers.append(page_parser)
+
     entries = []
-    for raw in parser.entries[:100]:
+    seen_entries = set()
+    raw_entries = (raw for page_parser in parsers for raw in page_parser.entries)
+    for raw in raw_entries:
         video_page = urljoin(folder_url, raw["url"])
-        if not is_streamrizz_url(video_page):
+        if not is_streamrizz_url(video_page) or video_page in seen_entries:
             continue
         raw_thumbnail = raw.get("thumbnail")
         thumbnail = urljoin(folder_url, raw_thumbnail) if raw_thumbnail else None
@@ -751,13 +781,14 @@ def extract_streamrizz_folder(ydl, url: str) -> dict:
                 ensure_public_url(thumbnail)
         except HTTPException:
             continue
+        seen_entries.add(video_page)
         video_id = urlsplit(video_page).path.rstrip("/").rsplit("/", 1)[-1]
         format_id = f"streamrizz-{video_id}"
         entries.append({
             "id": video_id,
             "title": raw.get("title") or video_id,
             "thumbnail": thumbnail,
-            "_thumbnail_proxy": bool(thumbnail),
+            "_thumbnail_proxy": False,
             "webpage_url": video_page,
             "_streamrizz_url": video_page,
             "_streamrizz_format_id": format_id,
@@ -771,19 +802,27 @@ def extract_streamrizz_folder(ydl, url: str) -> dict:
                 "acodec": "unknown",
             }],
         })
+        if len(entries) >= MAX_STREAMRIZZ_FOLDER_ENTRIES:
+            break
 
     folders = []
-    for raw in parser.folders[:100]:
+    seen_folders = set()
+    raw_folders = (raw for page_parser in parsers for raw in page_parser.folders)
+    for raw in raw_folders:
         child_url = urljoin(folder_url, raw["url"])
-        if not streamrizz_folder_id(child_url):
+        if not streamrizz_folder_id(child_url) or child_url in seen_folders:
             continue
         try:
             ensure_public_url(child_url)
         except HTTPException:
             continue
+        seen_folders.add(child_url)
         folders.append({"title": raw["title"], "url": child_url})
+        if len(folders) >= 100:
+            break
 
-    parent_url = urljoin(folder_url, parser.parent_url) if parser.parent_url else None
+    parent_path = next((page_parser.parent_url for page_parser in parsers if page_parser.parent_url), None)
+    parent_url = urljoin(folder_url, parent_path) if parent_path else None
     if parent_url and not streamrizz_folder_id(parent_url):
         parent_url = None
 
@@ -2163,6 +2202,11 @@ def _self_check() -> None:
     folder_parser.feed('''
         <title>📂 Sample folder</title>
         <a class="back-btn" href="/f/parent">Back</a>
+        <a class="page-btn active" href="/f/sample?p=1">1</a>
+        <a class="page-btn" href="/f/sample?p=2">2</a>
+        <a class="page-btn" href="/f/sample?p=3">3</a>
+        <a class="page-btn" href="/f/other?p=20">Other folder</a>
+        <a class="page-btn" href="/f/sample?p=999">Too far</a>
         <a class="folder-chip" href="/f/child">Child folder</a>
         <article class="drive-file-card">
           <a class="thumb-link" href="/d/clip1"><img src="https://img.example/1.jpg"></a>
@@ -2176,6 +2220,9 @@ def _self_check() -> None:
     }]
     assert folder_parser.folders == [{"url": "/f/child", "title": "Child folder"}]
     assert folder_parser.parent_url == "/f/parent"
+    assert streamrizz_folder_page_numbers(
+        "https://streamrizz.com/f/sample", folder_parser.page_urls
+    ) == [1, 2, 3]
     assert preview_reader_target(
         "https://www.pornhub.com/view_video.php?viewkey=abc123"
     ) == ("PornHub", "http://www.pornhub.com/embed/abc123")
