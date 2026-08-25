@@ -60,6 +60,9 @@ PLATFORM_NAMES = {
     "twitter": "X (Twitter)",
     "threads": "Threads",
     "streamrizz": "Video",
+    "vid3y": "Video",
+    "directmedia": "Media",
+    "publicpage": "Web",
 }
 
 # Options shared by every extraction. `skip_download` guarantees yt-dlp never
@@ -84,7 +87,7 @@ YDL_OPTS = {
 # remuxing, so they are only ever offered when nothing else exists.
 STREAMING_PROTOCOLS = ("m3u8", "m3u8_native", "http_dash_segments", "mhtml")
 
-IMAGE_EXTS = ("jpg", "jpeg", "png", "webp", "heic", "gif")
+IMAGE_EXTS = ("jpg", "jpeg", "png", "webp", "heic", "gif", "avif", "bmp", "tif", "tiff", "svg")
 VIDEO_EXTS = ("mp4", "webm", "mov", "m4v", "mkv", "avi", "m3u8")
 
 CHUNK_SIZE = 64 * 1024
@@ -382,15 +385,27 @@ def parse_public_media(page_url: str, page: str) -> dict:
             "http_headers": {"Referer": page_url},
         })
 
-    if not formats:
-        raise yt_dlp.utils.DownloadError("No public video source was found in that page.")
-
     thumbnail = urljoin(page_url, parser.thumbnail) if parser.thumbnail else None
     if thumbnail:
         try:
             ensure_public_url(thumbnail)
         except HTTPException:
             thumbnail = None
+    # Open Graph/Twitter images are the most reliable generic signal that an
+    # otherwise unknown page is an image post. Do not also expose a video
+    # poster as a photo when a real video source was already discovered.
+    if not formats and thumbnail:
+        ext = direct_image_ext(thumbnail) or "jpg"
+        formats.append({
+            "format_id": "public-image-1",
+            "format_note": "Image",
+            "url": thumbnail,
+            "ext": ext,
+            "protocol": urlsplit(thumbnail).scheme,
+            "vcodec": "none",
+            "acodec": "none",
+            "http_headers": {"Referer": page_url},
+        })
     title = re.sub(r"\s+", " ", "".join(parser.title_parts)).strip()[:300] or "Untitled media"
     return {
         "id": urlsplit(page_url).path.rstrip("/").rsplit("/", 1)[-1] or "public-video",
@@ -400,6 +415,7 @@ def parse_public_media(page_url: str, page: str) -> dict:
         "extractor": "generic-public-page",
         "extractor_key": "PublicPage",
         "formats": formats,
+        "_page_preview_url": page_url if not formats else None,
     }
 
 
@@ -449,44 +465,86 @@ def aceimg_id(url: str) -> str | None:
     return match.group(1) if match else None
 
 
+def vid3y_media(url: str) -> tuple[str, str] | None:
+    """Resolve Vid3y's click-through page to its predictable media CDN URL."""
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if host in ("cdn.vid3y.my.id", "www.cdn.vid3y.my.id"):
+        match = re.fullmatch(r"/([A-Za-z0-9_-]+)/?", parts.path)
+        clip_id = match.group(1) if match else None
+        source = "videy"
+    elif host in ("vid3y.my.id", "www.vid3y.my.id"):
+        clip_id = (parse_qs(parts.query).get("v") or [None])[0]
+        source = (parse_qs(parts.query).get("sumber") or ["videy"])[0].lower()
+    else:
+        return None
+    if not clip_id or not re.fullmatch(r"[A-Za-z0-9_-]+", clip_id):
+        return None
+    bases = {
+        "videy": "https://cdn2.videy.co/",
+        "slicedrive": "https://cdn.slicerdive.online/",
+        "box": "https://box.vchod.cc/videos/",
+        "aceimg": "https://cdn.aceimg.com/",
+        "aceimg2": "https://cdn2.aceimg.com/",
+    }
+    base = bases.get(source)
+    return (clip_id, f"{base}{clip_id}.mp4") if base else None
+
+
 def direct_image_ext(url: str) -> str | None:
     ext = (urlsplit(url).path.rsplit(".", 1)[-1] or "").lower()
     return ext if ext in IMAGE_EXTS else None
 
 
-def extract_direct_image(ydl, url: str) -> dict:
-    """Validate and expose a public image URL as a downloadable media item."""
-    ext = direct_image_ext(url)
-    if not ext:
-        raise yt_dlp.utils.DownloadError("Invalid public image URL.")
+def probe_direct_media(ydl, url: str) -> dict | None:
+    """Return media metadata when a URL itself responds with image/video bytes."""
     ensure_public_url(url)
     try:
         response = ydl.urlopen(YdlRequest(url, headers={"Range": "bytes=0-0"}))
         try:
             ensure_public_url(response.url)
-            content_type = (response.headers.get("Content-Type") or "").lower()
-            if not content_type.startswith("image/"):
-                raise yt_dlp.utils.DownloadError("That URL did not return an image file.")
+            content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].lower()
+            kind = "image" if content_type.startswith("image/") else (
+                "video" if content_type.startswith("video/") else None
+            )
+            path_ext = (urlsplit(response.url).path.rsplit(".", 1)[-1] or "").lower()
+            if kind is None and content_type not in ("text/html", "application/xhtml+xml"):
+                if path_ext in IMAGE_EXTS:
+                    kind = "image"
+                elif path_ext in VIDEO_EXTS:
+                    kind = "video"
+            if kind is None:
+                return None
+            ext = path_ext if path_ext in (*IMAGE_EXTS, *VIDEO_EXTS) else (
+                mimetypes.guess_extension(content_type or "") or f".{kind}"
+            ).lstrip(".")
             content_range = response.headers.get("Content-Range") or ""
             size_match = re.search(r"/(\d+)$", content_range)
             filesize = int(size_match.group(1)) if size_match else None
+            media_url = response.url
         finally:
             response.close()
-    except (HTTPException, yt_dlp.utils.DownloadError):
+    except HTTPException:
         raise
-    except Exception as exc:
-        raise yt_dlp.utils.DownloadError(f"Could not resolve public image: {exc}") from exc
-    filename = urlsplit(url).path.rstrip("/").rsplit("/", 1)[-1]
+    except Exception:
+        # A failed probe must not prevent the site extractor or HTML scanner
+        # from trying the same URL through their normal paths.
+        return None
+    filename = urlsplit(media_url).path.rstrip("/").rsplit("/", 1)[-1] or f"media.{ext}"
+    if "." not in filename:
+        filename = f"{filename}.{ext}"
     return {
         "id": filename.rsplit(".", 1)[0],
         "title": filename,
-        "thumbnail": url,
+        "thumbnail": media_url if kind == "image" else None,
         "webpage_url": url,
-        "extractor": "public-image",
-        "extractor_key": "PublicImage",
-        "url": url,
+        "extractor": "direct-media",
+        "extractor_key": "DirectMedia",
+        "url": media_url,
         "ext": ext,
         "filesize": filesize,
+        "vcodec": "none" if kind == "image" else "unknown",
+        "acodec": "none" if kind == "image" else "unknown",
     }
 
 
@@ -559,6 +617,14 @@ def extract_aceimg(ydl, url: str) -> dict:
     return extract_direct_mp4(
         ydl, url, clip_id, f"https://cdn2.aceimg.com/{clip_id}.mp4", "Aceimg"
     )
+
+
+def extract_vid3y(ydl, url: str) -> dict:
+    resolved = vid3y_media(url)
+    if not resolved:
+        raise yt_dlp.utils.DownloadError("Invalid Vid3y video URL.")
+    clip_id, media_url = resolved
+    return extract_direct_mp4(ydl, url, clip_id, media_url, "Vid3y")
 
 
 def js_string(page: str, name: str) -> str:
@@ -972,6 +1038,157 @@ def make_ydl(
         add_x_auth_cookies(ydl, *x_cookie_values())
     return ydl
 
+
+def is_instagram_url(url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower()
+    return host in ("instagram.com", "www.instagram.com")
+
+
+def best_thumbnail(info: dict) -> str | None:
+    thumbnails = [item for item in (info.get("thumbnails") or []) if item.get("url")]
+    if not thumbnails:
+        return info.get("thumbnail")
+    return max(
+        enumerate(thumbnails),
+        key=lambda item: (
+            (item[1].get("width") or 0) * (item[1].get("height") or 0),
+            item[0],
+        ),
+    )[1]["url"]
+
+
+def normalize_instagram_media(info: dict, url: str) -> dict:
+    """Keep Instagram photo carousel entries that yt-dlp otherwise drops."""
+    raw_entries = info.get("entries") if info.get("entries") is not None else [info]
+    entries = []
+    total = len(raw_entries)
+    for index, raw in enumerate(raw_entries):
+        entry = {**raw}
+        image_url = best_thumbnail(entry)
+        if image_url and not entry.get("thumbnail"):
+            entry["thumbnail"] = image_url
+            entry["_thumbnail_proxy"] = True
+        if not entry.get("formats") and not entry.get("url"):
+            if not image_url:
+                continue
+            ensure_public_url(image_url)
+            entry.update({
+                "url": image_url,
+                "thumbnail": image_url,
+                "_thumbnail_proxy": True,
+                "format_id": f"instagram-image-{index + 1}",
+                "ext": direct_image_ext(image_url) or "jpg",
+                "vcodec": "none",
+                "acodec": "none",
+            })
+        if total > 1 and not entry.get("title"):
+            entry["title"] = f"{info.get('title') or 'Instagram post'} #{index + 1}"
+        entry.setdefault("webpage_url", url)
+        entries.append(entry)
+
+    if info.get("entries") is None:
+        if not entries:
+            raise yt_dlp.utils.DownloadError("Instagram returned no downloadable media.")
+        return entries[0]
+    if not entries:
+        raise yt_dlp.utils.DownloadError("Instagram returned no downloadable media.")
+    return {**info, "entries": entries, "webpage_url": url}
+
+
+def extract_instagram(ydl, url: str) -> dict:
+    # process=False preserves image-only entries. yt-dlp's normal processing
+    # currently turns each of those valid carousel entries into null.
+    return normalize_instagram_media(
+        ydl.extract_info(url, download=False, process=False), url
+    )
+
+
+def build_x_photo_info(status: dict, url: str, tweet_id: str) -> dict | None:
+    user = status.get("user") or {}
+    text = (status.get("full_text") or status.get("text") or "").replace("\n", " ").strip()
+    uploader = user.get("name") or user.get("screen_name")
+    title = " - ".join(value for value in (uploader, text) if value) or f"X post {tweet_id}"
+    entries = []
+    media = (status.get("extended_entities") or {}).get("media") or []
+    for index, item in enumerate(media):
+        if item.get("type") != "photo":
+            continue
+        image_url = item.get("media_url_https") or item.get("media_url")
+        if not image_url:
+            continue
+        parts = urlsplit(image_url)
+        query = parse_qs(parts.query)
+        query["name"] = ["orig"]
+        image_url = parts._replace(query=urlencode(query, doseq=True)).geturl()
+        try:
+            ensure_public_url(image_url)
+        except HTTPException:
+            continue
+        entries.append({
+            "id": f"{tweet_id}-photo-{index + 1}",
+            "title": f"{title} #{index + 1}" if len(media) > 1 else title,
+            "uploader": uploader,
+            "webpage_url": url,
+            "thumbnail": image_url,
+            "_thumbnail_proxy": True,
+            "url": image_url,
+            "format_id": f"twitter-image-{index + 1}",
+            "ext": direct_image_ext(image_url) or "jpg",
+            "vcodec": "none",
+            "acodec": "none",
+            "http_headers": {"Referer": "https://x.com/"},
+        })
+    if not entries:
+        return None
+    return {
+        "_type": "playlist",
+        "id": tweet_id,
+        "title": title,
+        "uploader": uploader,
+        "webpage_url": url,
+        "extractor": "twitter",
+        "extractor_key": "Twitter",
+        "entries": entries,
+    }
+
+
+def x_photo_info(ydl, url: str) -> dict | None:
+    match = re.search(r"/(?:status|statuses)/(\d+)", urlsplit(url).path)
+    if not match:
+        return None
+    tweet_id = match.group(1)
+    try:
+        from yt_dlp.extractor.twitter import TwitterIE
+
+        extractor = TwitterIE(ydl)
+        extractor.initialize()
+        status = extractor._extract_status(tweet_id)
+    except Exception:
+        return None
+    return build_x_photo_info(status, url, tweet_id)
+
+
+def extract_x_media(ydl, url: str) -> dict:
+    primary = None
+    primary_error = None
+    try:
+        primary = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as exc:
+        primary_error = exc
+    photos = x_photo_info(ydl, url)
+    if primary and photos:
+        return {
+            **primary,
+            "_type": "playlist",
+            "entries": [*entries_of(primary), *entries_of(photos)],
+            "webpage_url": url,
+        }
+    if primary:
+        return primary
+    if photos:
+        return photos
+    raise primary_error or yt_dlp.utils.DownloadError("X returned no downloadable media.")
+
 def friendly_platform(info: dict) -> str:
     """Turn a yt-dlp extractor key such as `TikTok:user` into `TikTok`."""
     key = (info.get("extractor_key") or info.get("extractor") or "").lower()
@@ -1015,8 +1232,9 @@ def run_extraction(
     ensure_public_url(url)
 
     try:
-        if direct_image_ext(url):
-            info = extract_direct_image(ydl, url)
+        direct = probe_direct_media(ydl, url)
+        if direct:
+            info = direct
         elif streamrizz_folder_id(url):
             info = extract_streamrizz_folder(ydl, url)
         elif is_streamrizz_url(url):
@@ -1025,6 +1243,18 @@ def run_extraction(
             info = extract_videeyss(ydl, url)
         elif aceimg_id(url):
             info = extract_aceimg(ydl, url)
+        elif vid3y_media(url):
+            info = extract_vid3y(ydl, url)
+        elif is_instagram_url(url):
+            try:
+                info = extract_instagram(ydl, url)
+            except yt_dlp.utils.DownloadError as exc:
+                try:
+                    info = extract_public_page(url)
+                except Exception:
+                    raise exc
+        elif is_x_url(url):
+            info = extract_x_media(ydl, url)
         else:
             try:
                 info = ydl.extract_info(url, download=False)
@@ -1034,10 +1264,11 @@ def run_extraction(
                         info = extract_preview_only(ydl, url)
                     except Exception:
                         raise exc
-                elif "unsupported url" in str(exc).lower():
-                    info = extract_public_page(url)
                 else:
-                    raise
+                    try:
+                        info = extract_public_page(url)
+                    except Exception:
+                        raise exc
     except HTTPException:
         raise
     except yt_dlp.utils.DownloadError as exc:
@@ -1450,8 +1681,9 @@ def extract(payload: ExtractRequest):
     items = [build_item(entry, i) for i, entry in enumerate(entries_of(info))]
     items = [item for item in items if item["formats"] or item["thumbnail"]]
     folders = info.get("_folders") or []
+    page_preview_url = info.get("_page_preview_url")
 
-    if not items and not folders:
+    if not items and not folders and not page_preview_url:
         raise HTTPException(
             status_code=400,
             detail="No downloadable media or preview image was found at that link.",
@@ -1468,6 +1700,10 @@ def extract(payload: ExtractRequest):
         "items": items,
         "folders": folders,
         "parent_url": info.get("_parent_url"),
+        "page_preview": ({
+            "url": page_preview_url,
+            "title": info.get("title") or "Source page",
+        } if page_preview_url else None),
     }
 
 
@@ -1735,6 +1971,26 @@ def _self_check() -> None:
     assert aceimg_id("https://aceimg.example/2ZSqnueRR") is None
     assert direct_image_ext("https://cdn.example/photo.JPG?size=large") == "jpg"
     assert direct_image_ext("https://cdn.example/video.mp4") is None
+    assert vid3y_media("https://cdn.vid3y.my.id/2bnwZ5S21") == (
+        "2bnwZ5S21", "https://cdn2.videy.co/2bnwZ5S21.mp4"
+    )
+    assert vid3y_media("https://vid3y.my.id/?v=abc123&sumber=aceimg2") == (
+        "abc123", "https://cdn2.aceimg.com/abc123.mp4"
+    )
+    instagram = normalize_instagram_media({
+        "title": "Photo post",
+        "entries": [{"thumbnails": [{"url": "https://93.184.216.34/photo.jpg"}]}],
+    }, "https://www.instagram.com/p/example/")
+    assert instagram["entries"][0]["format_id"] == "instagram-image-1"
+    assert instagram["entries"][0]["ext"] == "jpg"
+    twitter = build_x_photo_info({
+        "text": "Photo tweet",
+        "user": {"name": "Tester"},
+        "extended_entities": {"media": [{
+            "type": "photo", "media_url_https": "https://93.184.216.34/x.jpg",
+        }]},
+    }, "https://x.com/test/status/1", "1")
+    assert twitter and twitter["entries"][0]["format_id"] == "twitter-image-1"
     assert js_string(
         r"const playerPath = 'https://streamrizz.com/stream.php?bucket=x\u0026id=y';",
         "playerPath",
@@ -1788,6 +2044,15 @@ def _self_check() -> None:
     assert json_media_urls(json.loads(parser.json_ld[0])) == [
         "https://cdn.example/master.m3u8"
     ]
+    public_image = parse_public_media(
+        "https://93.184.216.34/post",
+        '<title>Photo</title><meta property="og:image" content="/photo.jpg">',
+    )
+    assert public_image["formats"][0]["vcodec"] == "none"
+    public_empty = parse_public_media(
+        "https://93.184.216.34/post", "<title>Unknown page</title>"
+    )
+    assert public_empty["_page_preview_url"] == "https://93.184.216.34/post"
     try:
         ensure_public_url("http://127.0.0.1/video.mp4")
         raise AssertionError("loopback URLs must be rejected")

@@ -225,6 +225,27 @@ function renderFolders(data) {
   return section;
 }
 
+function renderPagePreview(preview) {
+  const section = document.createElement("section");
+  section.className = "page-preview-panel";
+  section.innerHTML = `
+    <div class="page-preview-heading">
+      <div>
+        <span class="tag">Source page</span>
+        <h3>${escapeHtml(preview.title || "No direct media detected")}</h3>
+      </div>
+      <div class="page-preview-actions">
+        <button type="button" class="page-rescan" data-rescan-url="${escapeHtml(preview.url)}">Scan again</button>
+        <a href="${escapeHtml(preview.url)}" target="_blank" rel="noopener noreferrer">Open source ↗</a>
+      </div>
+    </div>
+    <p class="page-preview-note">No downloadable file was exposed yet. You can interact with the page below. If it opens a different address, paste that new address into Saveflow.</p>
+    <iframe src="${escapeHtml(preview.url)}" title="${escapeHtml(preview.title || "Source page")}"
+            sandbox="allow-scripts allow-presentation" allow="autoplay; fullscreen"
+            loading="lazy" referrerpolicy="no-referrer"></iframe>`;
+  return section;
+}
+
 function renderMedia(data, sourceUrl) {
   const items = data.items || [];
   const groups = [
@@ -280,6 +301,9 @@ function renderResults(data, requestedUrl) {
   }
   const media = renderMedia(data, sourceUrl);
   if (media) results.appendChild(media);
+  if (data.page_preview) {
+    results.appendChild(renderPagePreview(data.page_preview));
+  }
   results.hidden = !results.children.length;
   if (results.children.length) {
     results.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -291,6 +315,12 @@ function renderResults(data, requestedUrl) {
 // look ignored. There is no completion event for a plain navigation download,
 // so the label simply reverts on a timer.
 results.addEventListener("click", async (event) => {
+  const rescan = event.target.closest(".page-rescan");
+  if (rescan) {
+    await loadMedia(rescan.dataset.rescanUrl);
+    return;
+  }
+
   const tab = event.target.closest(".media-tab");
   if (tab) {
     const key = tab.dataset.mediaTab;
