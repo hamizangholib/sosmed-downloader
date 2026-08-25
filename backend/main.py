@@ -332,6 +332,65 @@ def is_streamrizz_url(url: str) -> bool:
     )
 
 
+def videeyss_id(url: str) -> str | None:
+    """Return the public clip id used by Videeyss' click-to-load player."""
+    parts = urlsplit(url)
+    if (parts.hostname or "").lower() not in ("videeyss.shop", "www.videeyss.shop"):
+        return None
+    match = re.fullmatch(r"/([A-Za-z0-9_-]+)/?", parts.path)
+    return match.group(1) if match else None
+
+
+def extract_videeyss(ydl, url: str) -> dict:
+    """Resolve the MP4 that Videeyss inserts only after its Play button is clicked."""
+    clip_id = videeyss_id(url)
+    if not clip_id:
+        raise yt_dlp.utils.DownloadError("Invalid Videeyss video URL.")
+
+    media_url = f"https://cdn2.videy.co/{clip_id}.mp4"
+    ensure_public_url(media_url)
+    try:
+        response = ydl.urlopen(YdlRequest(media_url, headers={
+            "Referer": url,
+            "Range": "bytes=0-0",
+        }))
+        try:
+            ensure_public_url(response.url)
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            if not content_type.startswith("video/"):
+                raise yt_dlp.utils.DownloadError("Videeyss did not return a video file.")
+            content_range = response.headers.get("Content-Range") or ""
+            size_match = re.search(r"/(\d+)$", content_range)
+            filesize = int(size_match.group(1)) if size_match else None
+        finally:
+            response.close()
+    except HTTPException:
+        raise
+    except yt_dlp.utils.DownloadError:
+        raise
+    except Exception as exc:
+        raise yt_dlp.utils.DownloadError(f"Could not resolve Videeyss media: {exc}") from exc
+
+    return {
+        "id": clip_id,
+        "title": clip_id,
+        "webpage_url": url,
+        "extractor": "videeyss",
+        "extractor_key": "Videeyss",
+        "formats": [{
+            "format_id": "videeyss-mp4",
+            "format_note": "MP4",
+            "url": media_url,
+            "ext": "mp4",
+            "protocol": "https",
+            "vcodec": "unknown",
+            "acodec": "unknown",
+            "filesize": filesize,
+            "http_headers": {"Referer": url},
+        }],
+    }
+
+
 def js_string(page: str, name: str) -> str:
     match = re.search(
         rf"\b(?:const|let|var)\s+{re.escape(name)}\s*=\s*(['\"])(.*?)\1",
@@ -502,6 +561,8 @@ def run_extraction(ydl, url: str, *, x_authenticated: bool = False) -> dict:
     try:
         if is_streamrizz_url(url):
             info = extract_streamrizz(ydl, url)
+        elif videeyss_id(url):
+            info = extract_videeyss(ydl, url)
         else:
             try:
                 info = ydl.extract_info(url, download=False)
@@ -1019,6 +1080,10 @@ def _self_check() -> None:
     )
     assert is_streamrizz_url("https://streamrizz.com/d/abc_123-x")
     assert not is_streamrizz_url("https://streamrizz.example/d/abc_123-x")
+    assert videeyss_id("https://videeyss.shop/DFNXJw7g1") == "DFNXJw7g1"
+    assert videeyss_id("https://www.videeyss.shop/abc_123-x/") == "abc_123-x"
+    assert videeyss_id("https://videeyss.shop/a/b") is None
+    assert videeyss_id("https://videeyss.example/DFNXJw7g1") is None
     assert js_string(
         r"const playerPath = 'https://streamrizz.com/stream.php?bucket=x\u0026id=y';",
         "playerPath",
