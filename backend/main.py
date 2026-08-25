@@ -719,8 +719,60 @@ def add_x_auth_cookies(ydl, auth_token: str | None, ct0: str | None) -> bool:
     return True
 
 
-def make_ydl(*, x_authenticated: bool = False, streamrizz: bool = False):
+def validate_proxy_url(proxy: str) -> str:
+    parts = urlsplit(proxy)
+    if (
+        parts.scheme not in ("http", "https", "socks4", "socks4a", "socks5", "socks5h")
+        or not parts.hostname
+        or parts.query
+        or parts.fragment
+    ):
+        raise RuntimeError(
+            "Media proxies must be valid HTTP(S) or SOCKS proxy URLs."
+        )
+    return proxy
+
+
+def media_proxy_urls(url: str | None) -> list[str]:
+    """Build the ordered proxy list for sites that need alternate outbound IPs."""
+    if not url or not preview_reader_target(url):
+        return []
+
+    proxies = [
+        value.strip()
+        for value in re.split(
+            r"[\r\n,]+",
+            os.getenv("MEDIA_PROXY_URLS", "") or os.getenv("MEDIA_PROXY_URL", ""),
+        )
+        if value.strip()
+    ]
+
+    servers = [
+        value.strip()
+        for value in re.split(r"[\r\n,]+", os.getenv("MEDIA_PROXY_SERVERS", ""))
+        if value.strip()
+    ]
+    username = os.getenv("MEDIA_PROXY_USERNAME", "").strip()
+    password = os.getenv("MEDIA_PROXY_PASSWORD", "").strip()
+    if bool(username) != bool(password):
+        raise RuntimeError(
+            "MEDIA_PROXY_USERNAME and MEDIA_PROXY_PASSWORD must be set together."
+        )
+    auth = f"{quote(username, safe='')}:{quote(password, safe='')}@" if username else ""
+    proxies.extend(f"http://{auth}{server}" for server in servers)
+
+    return list(dict.fromkeys(validate_proxy_url(proxy) for proxy in proxies))
+
+
+def make_ydl(
+    *,
+    proxy: str | None = None,
+    x_authenticated: bool = False,
+    streamrizz: bool = False,
+):
     opts = {**YDL_OPTS, **({"nocheckcertificate": True} if streamrizz else {})}
+    if proxy:
+        opts["proxy"] = proxy
     ydl = yt_dlp.YoutubeDL(opts)
     if x_authenticated:
         add_x_auth_cookies(ydl, *x_cookie_values())
@@ -754,7 +806,13 @@ def safe_filename(title: str | None, ext: str | None) -> str:
     return f"{base}.{ext or 'mp4'}"
 
 
-def run_extraction(ydl, url: str, *, x_authenticated: bool = False) -> dict:
+def run_extraction(
+    ydl,
+    url: str,
+    *,
+    x_authenticated: bool = False,
+    preview_fallback: bool = True,
+) -> dict:
     """Run yt-dlp on an existing session and map its failures to HTTP errors."""
     ensure_public_url(url)
 
@@ -769,7 +827,7 @@ def run_extraction(ydl, url: str, *, x_authenticated: bool = False) -> dict:
             try:
                 info = ydl.extract_info(url, download=False)
             except yt_dlp.utils.DownloadError as exc:
-                if preview_reader_target(url):
+                if preview_fallback and preview_reader_target(url):
                     try:
                         info = extract_preview_only(ydl, url)
                     except Exception:
@@ -825,7 +883,35 @@ def extract_with_session(url: str):
     """Extract anonymously, retrying with X cookies only for an explicit auth gate."""
     # Streamrizz's current media CDN has an expired certificate. Keep the bypass
     # scoped to this one integration instead of weakening every platform.
-    ydl = make_ydl(streamrizz=bool(is_streamrizz_url(url) or streamrizz_folder_id(url)))
+    streamrizz = bool(is_streamrizz_url(url) or streamrizz_folder_id(url))
+    proxies = media_proxy_urls(url)
+    if proxies:
+        last_error = None
+        for proxy in proxies:
+            ydl = make_ydl(proxy=proxy, streamrizz=streamrizz)
+            try:
+                info = run_extraction(ydl, url, preview_fallback=False)
+                if not any(
+                    entry.get("url") or entry.get("formats")
+                    for entry in entries_of(info)
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="That proxy returned metadata without downloadable media.",
+                    )
+                return ydl, info
+            except HTTPException as exc:
+                last_error = exc
+                ydl.close()
+
+        ydl = make_ydl()
+        try:
+            return ydl, extract_preview_only(ydl, url)
+        except Exception:
+            ydl.close()
+            raise last_error
+
+    ydl = make_ydl(streamrizz=streamrizz)
     try:
         return ydl, run_extraction(ydl, url)
     except HTTPException as exc:
@@ -1419,6 +1505,53 @@ def _self_check() -> None:
         assert exc.status_code == 400
     assert normalize_cookie_value(' "auth_token=test-auth" ', "auth_token") == "test-auth"
     assert normalize_cookie_value("test-csrf", "ct0") == "test-csrf"
+
+    proxy_env_names = (
+        "MEDIA_PROXY_URL",
+        "MEDIA_PROXY_URLS",
+        "MEDIA_PROXY_SERVERS",
+        "MEDIA_PROXY_USERNAME",
+        "MEDIA_PROXY_PASSWORD",
+    )
+    previous_proxy_env = {name: os.environ.get(name) for name in proxy_env_names}
+    try:
+        for name in proxy_env_names:
+            os.environ.pop(name, None)
+        os.environ["MEDIA_PROXY_SERVERS"] = "proxy-a.example:8080,proxy-b.example:8081"
+        os.environ["MEDIA_PROXY_USERNAME"] = "user@example"
+        os.environ["MEDIA_PROXY_PASSWORD"] = "pass:word"
+        expected_proxies = [
+            "http://user%40example:pass%3Aword@proxy-a.example:8080",
+            "http://user%40example:pass%3Aword@proxy-b.example:8081",
+        ]
+        assert media_proxy_urls("https://www.xnxx.com/video-abc/sample") == expected_proxies
+        assert media_proxy_urls(
+            "https://www.pornhub.com/view_video.php?viewkey=abc123"
+        ) == expected_proxies
+        assert media_proxy_urls("https://www.youtube.com/watch?v=abc123") == []
+        os.environ.pop("MEDIA_PROXY_SERVERS")
+        os.environ.pop("MEDIA_PROXY_USERNAME")
+        os.environ.pop("MEDIA_PROXY_PASSWORD")
+        os.environ["MEDIA_PROXY_URLS"] = (
+            "http://proxy-a.example:8080\nhttp://proxy-a.example:8080,"
+            "socks5://proxy-b.example:1080"
+        )
+        assert media_proxy_urls("https://www.xnxx.com/video-abc/sample") == [
+            "http://proxy-a.example:8080",
+            "socks5://proxy-b.example:1080",
+        ]
+        os.environ["MEDIA_PROXY_URLS"] = "file:///not-a-proxy"
+        try:
+            media_proxy_urls("https://www.xnxx.com/video-abc/sample")
+            raise AssertionError("invalid proxy URLs must be rejected")
+        except RuntimeError:
+            pass
+    finally:
+        for name, value in previous_proxy_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
     cookie_ydl = make_ydl()
     try:
