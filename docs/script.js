@@ -152,7 +152,7 @@ function renderCard(item, formats, platform, index, total, sourceUrl) {
       ? `<div class="result-thumb">
            ${previewFormat.kind === "image"
              ? `<img src="${escapeHtml(downloadUrl(sourceUrl, item, previewFormat))}" alt="" loading="lazy" />`
-             : `<video src="${escapeHtml(downloadUrl(sourceUrl, item, previewFormat))}" muted preload="metadata" playsinline></video>`}
+             : `<video src="${escapeHtml(downloadUrl(sourceUrl, item, previewFormat))}" controls muted preload="metadata" playsinline></video>`}
            ${duration ? `<span class="result-duration">${duration}</span>` : ""}
          </div>`
     : `<div class="result-thumb is-empty">No preview</div>`;

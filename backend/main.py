@@ -479,6 +479,51 @@ def aceimg_cdn_page(url: str) -> str | None:
     return f"https://aceimg.ink/{match.group(1)}" if match else None
 
 
+def is_acegimg_url(url: str) -> bool:
+    parts = urlsplit(url)
+    return (
+        (parts.hostname or "").lower() in ("cdn2.acegimg.com", "www.cdn2.acegimg.com")
+        and re.fullmatch(r"/[A-Za-z0-9_-]+\.[A-Za-z0-9]+", parts.path) is not None
+    )
+
+
+def aceimg_upload_media(url: str) -> tuple[str, str] | None:
+    """Resolve AceImg's upload page query to its public media CDN URL."""
+    parts = urlsplit(url)
+    if (
+        (parts.hostname or "").lower() not in ("aceimg.com", "www.aceimg.com")
+        or parts.path.rstrip("/") != "/upload"
+    ):
+        return None
+    filename = (parse_qs(parts.query).get("f") or [None])[0]
+    extensions = "|".join((*IMAGE_EXTS, *VIDEO_EXTS))
+    match = re.fullmatch(
+        rf"([A-Za-z0-9_-]+)\.({extensions})",
+        filename or "",
+        re.IGNORECASE,
+    )
+    return (
+        match.group(1), f"https://cdn.aceimg.com/{filename}"
+    ) if match else None
+
+
+def extract_acegimg(ydl, url: str) -> dict:
+    final_url, _ = fetch_public_html(url)
+    resolved = aceimg_upload_media(final_url)
+    if not resolved:
+        raise yt_dlp.utils.DownloadError("Acegimg did not redirect to a media file.")
+    _, media_url = resolved
+    info = probe_direct_media(ydl, media_url)
+    if not info:
+        raise yt_dlp.utils.DownloadError("Acegimg media is unavailable.")
+    return {
+        **info,
+        "webpage_url": url,
+        "extractor": "acegimg",
+        "extractor_key": "Acegimg",
+    }
+
+
 def vid3y_media(url: str) -> tuple[str, str] | None:
     """Resolve Vid3y's click-through page to its predictable media CDN URL."""
     parts = urlsplit(url)
@@ -1339,6 +1384,8 @@ def run_extraction(
             info = extract_streamrizz(ydl, url)
         elif videeyss_id(url):
             info = extract_videeyss(ydl, url)
+        elif is_acegimg_url(url):
+            info = extract_acegimg(ydl, url)
         elif aceimg_page := aceimg_cdn_page(url):
             info = extract_public_page(aceimg_page)
         elif aceimg_id(url):
@@ -2079,6 +2126,12 @@ def _self_check() -> None:
         "https://aceimg.ink/Vsbx6xpay"
     )
     assert aceimg_cdn_page("https://cdn.example/Vsbx6xpay.mp4") is None
+    assert is_acegimg_url("https://cdn2.acegimg.com/Vsbx6xpay.mp4")
+    assert not is_acegimg_url("https://cdn2.aceimg.com/Vsbx6xpay.mp4")
+    assert aceimg_upload_media("https://aceimg.com/upload/?f=KBTQCQpcx.mp4") == (
+        "KBTQCQpcx", "https://cdn.aceimg.com/KBTQCQpcx.mp4"
+    )
+    assert aceimg_upload_media("https://example.com/upload/?f=KBTQCQpcx.mp4") is None
     assert direct_image_ext("https://cdn.example/photo.JPG?size=large") == "jpg"
     assert direct_image_ext("https://cdn.example/video.mp4") is None
     assert vid3y_media("https://cdn.vid3y.my.id/2bnwZ5S21") == (
