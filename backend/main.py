@@ -686,6 +686,19 @@ def normalize_cookie_value(value: str | None, cookie_name: str) -> str | None:
     return value or None
 
 
+def normalize_env_value(value: str | None, *prefixes: str) -> str:
+    """Clean values copied from a dashboard without exposing their contents."""
+    value = (value or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    lowered = value.lower()
+    for prefix in prefixes:
+        marker = f"{prefix.lower()}="
+        if lowered.startswith(marker):
+            return value[len(marker):].strip()
+    return value
+
+
 def x_cookie_values() -> tuple[str | None, str | None]:
     return (
         normalize_cookie_value(os.getenv("X_AUTH_TOKEN"), "auth_token"),
@@ -768,8 +781,12 @@ def media_proxy_urls(url: str | None) -> list[str]:
         for value in re.split(r"[\r\n,]+", os.getenv("MEDIA_PROXY_SERVERS", ""))
         if value.strip()
     ]
-    username = os.getenv("MEDIA_PROXY_USERNAME", "").strip()
-    password = os.getenv("MEDIA_PROXY_PASSWORD", "").strip()
+    username = normalize_env_value(
+        os.getenv("MEDIA_PROXY_USERNAME"), "MEDIA_PROXY_USERNAME", "username"
+    )
+    password = normalize_env_value(
+        os.getenv("MEDIA_PROXY_PASSWORD"), "MEDIA_PROXY_PASSWORD", "password"
+    )
     if bool(username) != bool(password):
         raise RuntimeError(
             "MEDIA_PROXY_USERNAME and MEDIA_PROXY_PASSWORD must be set together."
@@ -783,6 +800,26 @@ def media_proxy_urls(url: str | None) -> list[str]:
     proxies.extend(f"http://{auth}{server}" for server in servers)
 
     return list(dict.fromkeys(validate_proxy_url(proxy) for proxy in proxies))
+
+
+def proxy_failure_kind(error: Exception) -> str:
+    messages = []
+    current: BaseException | None = error
+    while current and len(messages) < 4:
+        messages.append(str(current).lower())
+        current = current.__cause__ or current.__context__
+    message = " ".join(messages)
+    if "407" in message or "proxy authentication" in message:
+        return "proxy login rejected (HTTP 407)"
+    if "403" in message or "forbidden" in message:
+        return "destination rejected the proxy (HTTP 403)"
+    if "timed out" in message or "timeout" in message:
+        return "proxy connection timed out"
+    if any(marker in message for marker in (
+        "connection refused", "failed to connect", "unable to connect", "name resolution",
+    )):
+        return "proxy connection failed"
+    return "site extraction was blocked"
 
 
 def make_ydl(
@@ -919,6 +956,7 @@ def extract_with_session(url: str):
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     if proxies:
         last_error = None
+        failure_counts: dict[str, int] = {}
         for proxy in proxies:
             ydl = make_ydl(proxy=proxy, streamrizz=streamrizz)
             try:
@@ -934,19 +972,30 @@ def extract_with_session(url: str):
                 return ydl, info
             except HTTPException as exc:
                 last_error = exc
+                reason = proxy_failure_kind(exc)
+                failure_counts[reason] = failure_counts.get(reason, 0) + 1
                 ydl.close()
 
+        failure_summary = ", ".join(
+            f"{count}× {reason}" for reason, count in failure_counts.items()
+        ) or "unknown proxy error"
         ydl = make_ydl()
         try:
             info = extract_preview_only(ydl, url)
             info["_media_warning"] = (
-                f"Preview only: all {len(proxies)} configured media proxies failed. "
-                "Check their login credentials, quota, and allowed destination sites."
+                f"Preview only: all {len(proxies)} configured media proxies failed "
+                f"({failure_summary})."
             )
             return ydl, info
         except Exception:
             ydl.close()
-            raise last_error
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"All {len(proxies)} configured media proxies failed "
+                    f"({failure_summary})."
+                ),
+            ) from last_error
 
     ydl = make_ydl(streamrizz=streamrizz)
     try:
@@ -1215,8 +1264,12 @@ def healthcheck():
         for value in re.split(r"[\r\n,]+", os.getenv("MEDIA_PROXY_SERVERS", ""))
         if value.strip()
     ]
-    proxy_username = bool(os.getenv("MEDIA_PROXY_USERNAME", "").strip())
-    proxy_password = bool(os.getenv("MEDIA_PROXY_PASSWORD", "").strip())
+    proxy_username = bool(normalize_env_value(
+        os.getenv("MEDIA_PROXY_USERNAME"), "MEDIA_PROXY_USERNAME", "username"
+    ))
+    proxy_password = bool(normalize_env_value(
+        os.getenv("MEDIA_PROXY_PASSWORD"), "MEDIA_PROXY_PASSWORD", "password"
+    ))
     return {
         "status": "ok",
         "message": "Saveflow API is running.",
@@ -1576,6 +1629,11 @@ def _self_check() -> None:
         assert exc.status_code == 400
     assert normalize_cookie_value(' "auth_token=test-auth" ', "auth_token") == "test-auth"
     assert normalize_cookie_value("test-csrf", "ct0") == "test-csrf"
+    assert normalize_env_value(' "username=test-user" ', "username") == "test-user"
+    assert normalize_env_value("MEDIA_PROXY_PASSWORD=test-pass", "MEDIA_PROXY_PASSWORD") == "test-pass"
+    assert proxy_failure_kind(Exception("HTTP Error 407: Proxy Authentication Required")) == (
+        "proxy login rejected (HTTP 407)"
+    )
 
     proxy_env_names = (
         "MEDIA_PROXY_URL",
