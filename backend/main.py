@@ -22,6 +22,7 @@ import os
 import re
 import socket
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http.cookiejar import Cookie
 from html.parser import HTMLParser
 from urllib.error import HTTPError as UrlHTTPError
@@ -29,6 +30,7 @@ from urllib.parse import parse_qs, quote, urlencode, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import yt_dlp
+from curl_cffi import requests as curl_requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -1103,6 +1105,90 @@ def extract_instagram(ydl, url: str) -> dict:
     )
 
 
+def instagram_reader_page(shortcode: str, index: int) -> str:
+    reader_url = (
+        "https://r.jina.ai/http://www.instagram.com/p/"
+        f"{shortcode}/?img_index={index}"
+    )
+    try:
+        response = curl_requests.get(
+            reader_url,
+            headers={"Accept": "text/plain"},
+            timeout=25,
+        )
+        if response.status_code != 200 or len(response.content) > MAX_HTML_BYTES:
+            return ""
+        return response.text
+    except Exception:
+        return ""
+
+
+def extract_instagram_reader(url: str) -> dict:
+    """Use the public reader when Instagram blocks the deployment IP."""
+    match = re.search(r"/(?:p|reels?|tv)/([^/?#]+)", urlsplit(url).path)
+    if not match:
+        raise yt_dlp.utils.DownloadError("Invalid Instagram post URL.")
+    shortcode = match.group(1)
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        pages = list(pool.map(
+            lambda index: instagram_reader_page(shortcode, index),
+            range(1, 11),
+        ))
+
+    title = "Instagram post"
+    entries = []
+    seen = set()
+    for page in pages:
+        if not page:
+            continue
+        title_match = re.search(r"^Title:\s*(.+)$", page, re.MULTILINE)
+        if title_match and title == "Instagram post":
+            title = title_match.group(1).strip()[:300]
+        # Related posts appear after this marker and must not leak into results.
+        post_only = page.split("\nMore posts from ", 1)[0]
+        for image_match in re.finditer(
+            r"!\[(?P<alt>[^\]]*)\]\((?P<url>https?://[^)\s]+)\)",
+            post_only,
+        ):
+            alt = image_match.group("alt")
+            image_url = image_match.group("url")
+            if "profile picture" in alt.lower() or "-15/" not in image_url:
+                continue
+            asset_key = urlsplit(image_url).path.rsplit("/", 1)[-1]
+            if not asset_key or asset_key in seen:
+                continue
+            try:
+                ensure_public_url(image_url)
+            except HTTPException:
+                continue
+            seen.add(asset_key)
+            entries.append({
+                "id": f"{shortcode}-image-{len(entries) + 1}",
+                "title": re.sub(r"^Image\s+\d+:\s*", "", alt).strip()
+                or f"Instagram photo {len(entries) + 1}",
+                "webpage_url": url,
+                "thumbnail": image_url,
+                "_thumbnail_proxy": True,
+                "url": image_url,
+                "format_id": f"instagram-reader-{len(entries) + 1}",
+                "ext": direct_image_ext(image_url) or "jpg",
+                "vcodec": "none",
+                "acodec": "none",
+                "http_headers": {"Referer": "https://www.instagram.com/"},
+            })
+    if not entries:
+        raise yt_dlp.utils.DownloadError("The public Instagram reader found no media.")
+    return {
+        "_type": "playlist",
+        "id": shortcode,
+        "title": title,
+        "webpage_url": url,
+        "extractor": "instagram",
+        "extractor_key": "Instagram",
+        "entries": entries[:10],
+    }
+
+
 def build_x_photo_info(status: dict, url: str, tweet_id: str) -> dict | None:
     user = status.get("user") or {}
     text = (status.get("full_text") or status.get("text") or "").replace("\n", " ").strip()
@@ -1250,9 +1336,12 @@ def run_extraction(
                 info = extract_instagram(ydl, url)
             except yt_dlp.utils.DownloadError as exc:
                 try:
-                    info = extract_public_page(url)
+                    info = extract_instagram_reader(url)
                 except Exception:
-                    raise exc
+                    try:
+                        info = extract_public_page(url)
+                    except Exception:
+                        raise exc
         elif is_x_url(url):
             info = extract_x_media(ydl, url)
         else:
