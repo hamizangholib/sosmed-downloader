@@ -29,3 +29,17 @@ test("keeps a trusted DOM hint even when the URL has no extension", () => {
   assert.equal(candidate.url, "https://example.com/media?id=42");
   assert.equal(candidate.kind, "image");
 });
+
+test("builds the official TVID MP4 fallback request from a signed HLS URL", () => {
+  const request = media.tvidFallbackRequest(
+    "https://api.tvid.app/api/public-hls/abc_123/master.m3u8?token=x&sess=sess_456",
+  );
+  assert.deepEqual(request, {
+    url: "https://api.tvid.app/api/public/abc_123/fallback",
+    body: {
+      failed_url: "https://api.tvid.app/api/public-hls/abc_123/master.m3u8?token=x&sess=sess_456",
+      sess: "sess_456",
+    },
+  });
+  assert.equal(media.tvidFallbackRequest("https://cdn.example/master.m3u8"), null);
+});

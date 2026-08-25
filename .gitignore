@@ -9,11 +9,15 @@ venv/
 .env.*
 !.env.example
 
-# Generated and local-only files
+# Local tools and references
 .claude/
 .vercel/
 graphify-out/
 referensi/
+
+# Release artifacts
+/saveflow-*.apk
+/saveflow-*.zip
 
 # OS
 .DS_Store

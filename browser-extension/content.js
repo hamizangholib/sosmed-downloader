@@ -96,6 +96,7 @@ function scheduleSend() {
 }
 
 function ensureOverlay() {
+  if (window !== window.top) return;
   if (document.getElementById("saveflow-helper-overlay")) return;
   const overlay = document.createElement("div");
   overlay.id = "saveflow-helper-overlay";

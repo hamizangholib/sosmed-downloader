@@ -12,6 +12,7 @@ const SAVEFLOW_HOSTS = new Set([
 ]);
 
 let sessions = {};
+const tvidFallbacks = new Map();
 const ready = chrome.storage.session.get("sessions").then((stored) => {
   sessions = stored.sessions || {};
 });
@@ -42,6 +43,34 @@ function mergeCandidates(session, incoming, baseUrl) {
     if (existing.size >= MAX_CANDIDATES) break;
   }
   session.candidates = [...existing.values()];
+}
+
+async function upgradeTvidCandidate(raw, baseUrl) {
+  const candidate = SaveflowMedia.normalizeCandidate(raw, baseUrl);
+  const request = SaveflowMedia.tvidFallbackRequest(candidate?.url);
+  if (!candidate || !request) return raw;
+  if (!tvidFallbacks.has(candidate.url)) {
+    tvidFallbacks.set(candidate.url, new Promise((resolve) => setTimeout(resolve, 400))
+      .then(() => fetch(request.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request.body),
+      }))
+      .then(async (response) => {
+        if (!response.ok) return null;
+        const payload = await response.json().catch(() => null);
+        return SaveflowMedia.asHttpUrl(payload?.fallback_url);
+      }).catch(() => null));
+  }
+  const fallbackUrl = await tvidFallbacks.get(candidate.url);
+  if (!fallbackUrl) tvidFallbacks.delete(candidate.url);
+  return fallbackUrl ? {
+    ...raw,
+    url: fallbackUrl,
+    kind: "video",
+    trustedHint: true,
+    source: "tvid-fallback",
+  } : raw;
 }
 
 async function pushResults(sourceTabId) {
@@ -97,7 +126,10 @@ async function handleMessage(message, sender) {
     if (!session) return { ok: false };
     session.pageUrl = SaveflowMedia.asHttpUrl(message.pageUrl, session.sourceUrl) || session.pageUrl;
     session.title = String(message.title || session.title).slice(0, 160);
-    mergeCandidates(session, message.candidates, session.pageUrl);
+    const upgraded = await Promise.all(
+      (message.candidates || []).map((candidate) => upgradeTvidCandidate(candidate, session.pageUrl)),
+    );
+    mergeCandidates(session, upgraded, session.pageUrl);
     await persist();
     await pushResults(sourceTabId);
     return { ok: true, count: session.candidates.length };
@@ -142,10 +174,11 @@ chrome.webRequest.onBeforeRequest.addListener(
     ready.then(async () => {
       const session = sessions[details.tabId];
       if (!session) return;
-      const candidate = SaveflowMedia.normalizeCandidate({
+      const upgraded = await upgradeTvidCandidate({
         url: details.url,
         source: "network",
       }, session.pageUrl);
+      const candidate = SaveflowMedia.normalizeCandidate(upgraded, session.pageUrl);
       if (!candidate || candidate.kind === "unknown") return;
       mergeCandidates(session, [candidate], session.pageUrl);
       await persist();

@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Saveflow Test Page</title>
+</head>
+<body>
+    <h1>Static Content</h1>
+    <video width="320" height="240" controls poster="https://via.placeholder.com/320x240.png?text=Poster">
+        <source src="https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4" type="video/mp4">
+        Your browser does not support the video tag.
+    </video>
+
+    <img src="https://via.placeholder.com/150" alt="Static Image">
+
+    <h1>Dynamic Content</h1>
+    <button id="addMediaBtn">Add Media Now</button>
+    <div id="container"></div>
+
+    <script>
+        document.getElementById('addMediaBtn').addEventListener('click', function() {
+            var container = document.getElementById('container');
+            
+            var newVideo = document.createElement('video');
+            newVideo.src = "https://www.w3schools.com/html/mov_bbb.mp4";
+            newVideo.controls = true;
+            container.appendChild(newVideo);
+
+            var newImg = document.createElement('img');
+            newImg.src = "https://via.placeholder.com/150/0000FF/808080 ?Text=Dynamic";
+            container.appendChild(newImg);
+        });
+    </script>
+</body>
+</html>

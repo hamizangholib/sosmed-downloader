@@ -65,6 +65,7 @@ PLATFORM_NAMES = {
     "vid3y": "Video",
     "directmedia": "Media",
     "publicpage": "Web",
+    "plidey": "Video",
 }
 
 # Options shared by every extraction. `skip_download` guarantees yt-dlp never
@@ -428,6 +429,224 @@ def parse_public_media(page_url: str, page: str) -> dict:
 
 def extract_public_page(url: str) -> dict:
     return parse_public_media(*fetch_public_html(url))
+
+
+def is_plidey_url(url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower()
+    return host == "plidey.pro" or host.endswith(".plidey.pro")
+
+
+def client_redirect_url(page_url: str, page: str) -> str | None:
+    """Read the small countdown redirect used by public file pages."""
+    direct = re.search(
+        r"(?:window\.)?location(?:\.href)?\s*=\s*(\"(?:\\.|[^\"\\])*\")",
+        page,
+    )
+    quoted = direct.group(1) if direct else None
+    if not quoted:
+        variable = re.search(
+            r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*"
+            r"(\"(?:\\.|[^\"\\])*\")",
+            page,
+        )
+        if variable and re.search(
+            rf"(?:window\.)?location(?:\.href)?\s*=\s*{re.escape(variable.group(1))}\b",
+            page,
+        ):
+            quoted = variable.group(2)
+    if not quoted:
+        return None
+    try:
+        return urljoin(page_url, json.loads(quoted))
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def fetch_public_html_session(session, url: str, referer: str | None = None) -> tuple[str, str]:
+    """curl-cffi variant of fetch_public_html that retains anti-bot cookies."""
+    current = url
+    current_referer = referer
+    for _ in range(6):
+        ensure_public_url(current)
+        headers = {
+            "Accept": "text/html,application/xhtml+xml",
+        }
+        if current_referer:
+            headers["Referer"] = current_referer
+        response = session.get(
+            current,
+            headers=headers,
+            allow_redirects=False,
+            timeout=30,
+        )
+        try:
+            final_url = str(response.url)
+            ensure_public_url(final_url)
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location")
+                if not location:
+                    raise yt_dlp.utils.DownloadError("The page returned an empty redirect.")
+                current_referer = final_url
+                current = urljoin(final_url, location)
+                continue
+            if response.status_code != 200:
+                raise yt_dlp.utils.DownloadError(
+                    f"The public page returned HTTP {response.status_code}."
+                )
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            if content_type and "html" not in content_type and "xhtml" not in content_type:
+                raise yt_dlp.utils.DownloadError("The URL is not an HTML video page.")
+            body = response.content
+            if len(body) > MAX_HTML_BYTES:
+                raise yt_dlp.utils.DownloadError("The page is too large to inspect safely.")
+            return final_url, response.text
+        finally:
+            response.close()
+    raise yt_dlp.utils.DownloadError("The page redirected too many times.")
+
+
+def extract_plidey(url: str) -> dict:
+    """Resolve Plidey's JS redirect and its one-time TVID iframe token."""
+    session = curl_requests.Session(impersonate="chrome")
+    try:
+        first_url, first_page = fetch_public_html_session(session, url)
+        redirect_url = client_redirect_url(first_url, first_page)
+        if not redirect_url:
+            raise yt_dlp.utils.DownloadError("Plidey did not provide its player redirect.")
+        ensure_public_url(redirect_url)
+
+        player_page_url, player_page = fetch_public_html_session(
+            session, redirect_url, referer=first_url
+        )
+        iframe_match = re.search(
+            r"<iframe\b[^>]*\bsrc=[\"']([^\"']+)[\"']",
+            player_page,
+            re.IGNORECASE,
+        )
+        if not iframe_match:
+            raise yt_dlp.utils.DownloadError("Plidey did not expose its media player.")
+        iframe_url = urljoin(player_page_url, iframe_match.group(1))
+        iframe_parts = urlsplit(iframe_url)
+        if iframe_parts.scheme != "https" or iframe_parts.hostname != "api.tvid.app":
+            raise yt_dlp.utils.DownloadError("Plidey returned an unsupported media player.")
+
+        iframe_url, iframe_page = fetch_public_html_session(
+            session, iframe_url, referer=player_page_url
+        )
+        public_id_match = re.search(
+            r"__VX_PUBLIC_ID__\s*=\s*[\"']([A-Za-z0-9_-]+)[\"']", iframe_page
+        )
+        session_match = re.search(
+            r"__VX_SESSION__\s*=\s*[\"']([A-Za-z0-9_-]+)[\"']", iframe_page
+        )
+        if not public_id_match or not session_match:
+            raise yt_dlp.utils.DownloadError("Plidey's media token was unavailable.")
+
+        public_id = public_id_match.group(1)
+        session_token = session_match.group(1)
+        api_url = urljoin(
+            iframe_url,
+            f"/api/public/{quote(public_id)}?via=embed&sess={quote(session_token)}",
+        )
+        ensure_public_url(api_url)
+        response = session.get(
+            api_url,
+            headers={
+                "Accept": "application/json",
+                "Referer": iframe_url,
+            },
+            allow_redirects=False,
+            timeout=30,
+        )
+        try:
+            ensure_public_url(str(response.url))
+            if response.status_code != 200:
+                raise yt_dlp.utils.DownloadError(
+                    f"Plidey's media service returned HTTP {response.status_code}."
+                )
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise yt_dlp.utils.DownloadError("Plidey's media response was invalid.")
+        finally:
+            response.close()
+
+        media_url = str(
+            payload.get("direct_url")
+            or payload.get("backup_direct_url")
+            or payload.get("backup_url")
+            or ""
+        ).strip()
+        if not media_url:
+            raise yt_dlp.utils.DownloadError("Plidey returned no playable media URL.")
+        ensure_public_url(media_url)
+        is_hls = ".m3u8" in urlsplit(media_url).path.lower() or "/api/public-hls/" in media_url
+        if is_hls:
+            # TVID enables its MP4 fallback only after the signed HLS URL has
+            # been requested once, mirroring what its browser player does.
+            playback_response = session.get(
+                media_url,
+                headers={
+                    "Referer": iframe_url,
+                },
+                allow_redirects=False,
+                timeout=30,
+                verify=False,
+            )
+            try:
+                ensure_public_url(str(playback_response.url))
+            finally:
+                playback_response.close()
+            fallback_url = urljoin(iframe_url, f"/api/public/{quote(public_id)}/fallback")
+            ensure_public_url(fallback_url)
+            fallback_response = session.post(
+                fallback_url,
+                headers={"Content-Type": "application/json", "Referer": iframe_url},
+                json={"failed_url": media_url, "sess": session_token},
+                allow_redirects=False,
+                timeout=30,
+            )
+            try:
+                ensure_public_url(str(fallback_response.url))
+                if fallback_response.status_code == 200:
+                    fallback_payload = fallback_response.json()
+                    fallback_media = str(
+                        fallback_payload.get("fallback_url") or ""
+                        if isinstance(fallback_payload, dict)
+                        else ""
+                    ).strip()
+                    if fallback_media:
+                        ensure_public_url(fallback_media)
+                        media_url = fallback_media
+                        is_hls = False
+            finally:
+                fallback_response.close()
+        thumbnail = str(payload.get("thumbnail_url") or "").strip() or None
+        if thumbnail:
+            ensure_public_url(thumbnail)
+        return {
+            "id": public_id,
+            "title": payload.get("title") or "Plidey video",
+            "thumbnail": thumbnail,
+            "duration": payload.get("duration_seconds"),
+            "webpage_url": url,
+            "extractor": "plidey",
+            "extractor_key": "Plidey",
+            "formats": [{
+                "format_id": "plidey-hls" if is_hls else "plidey-video",
+                "format_note": "HLS" if is_hls else "MP4",
+                "url": media_url,
+                "ext": "m3u8" if is_hls else "mp4",
+                "protocol": "m3u8_native" if is_hls else "https",
+                "vcodec": "unknown",
+                "acodec": "unknown",
+                "http_headers": {
+                    "Referer": iframe_url,
+                    "User-Agent": yt_dlp.utils.std_headers["User-Agent"],
+                },
+            }],
+        }
+    finally:
+        session.close()
 
 
 def is_streamrizz_url(url: str) -> bool:
@@ -1127,8 +1346,12 @@ def make_ydl(
     proxy: str | None = None,
     x_authenticated: bool = False,
     streamrizz: bool = False,
+    plidey: bool = False,
 ):
-    opts = {**YDL_OPTS, **({"nocheckcertificate": True} if streamrizz else {})}
+    opts = {
+        **YDL_OPTS,
+        **({"nocheckcertificate": True} if streamrizz or plidey else {}),
+    }
     if proxy:
         opts["proxy"] = proxy
     ydl = yt_dlp.YoutubeDL(opts)
@@ -1421,6 +1644,8 @@ def run_extraction(
             info = extract_streamrizz_folder(ydl, url)
         elif is_streamrizz_url(url):
             info = extract_streamrizz(ydl, url)
+        elif is_plidey_url(url):
+            info = extract_plidey(url)
         elif videeyss_id(url):
             info = extract_videeyss(ydl, url)
         elif is_acegimg_url(url):
@@ -1514,9 +1739,10 @@ def extract_info(url: str) -> dict:
 
 def extract_with_session(url: str):
     """Extract anonymously, retrying with X cookies only for an explicit auth gate."""
-    # Streamrizz's current media CDN has an expired certificate. Keep the bypass
-    # scoped to this one integration instead of weakening every platform.
+    # A small set of third-party media CDNs currently has expired certificates.
+    # Keep the bypass scoped to their adapters instead of weakening every platform.
     streamrizz = bool(is_streamrizz_url(url) or streamrizz_folder_id(url))
+    plidey = is_plidey_url(url)
     try:
         proxies = media_proxy_urls(url)
     except RuntimeError as exc:
@@ -1525,7 +1751,7 @@ def extract_with_session(url: str):
         last_error = None
         failure_counts: dict[str, int] = {}
         for proxy in proxies:
-            ydl = make_ydl(proxy=proxy, streamrizz=streamrizz)
+            ydl = make_ydl(proxy=proxy, streamrizz=streamrizz, plidey=plidey)
             try:
                 info = run_extraction(ydl, url, preview_fallback=False)
                 if not any(
@@ -1564,7 +1790,7 @@ def extract_with_session(url: str):
                 ),
             ) from last_error
 
-    ydl = make_ydl(streamrizz=streamrizz)
+    ydl = make_ydl(streamrizz=streamrizz, plidey=plidey)
     try:
         return ydl, run_extraction(ydl, url)
     except HTTPException as exc:
@@ -2167,6 +2393,12 @@ def _self_check() -> None:
     assert aceimg_cdn_page("https://cdn.example/Vsbx6xpay.mp4") is None
     assert is_acegimg_url("https://cdn2.acegimg.com/Vsbx6xpay.mp4")
     assert not is_acegimg_url("https://cdn2.aceimg.com/Vsbx6xpay.mp4")
+    assert is_plidey_url("https://cdn2qceimg.plidey.pro/d/jbxzafgds99")
+    assert not is_plidey_url("https://plidey.example/d/jbxzafgds99")
+    assert client_redirect_url(
+        "https://cdn.example/d/abc",
+        'const url = "https:\\/\\/player.example\\/watch"; window.location.href = url;',
+    ) == "https://player.example/watch"
     assert aceimg_upload_media("https://aceimg.com/upload/?f=KBTQCQpcx.mp4") == (
         "KBTQCQpcx", "https://cdn.aceimg.com/KBTQCQpcx.mp4"
     )

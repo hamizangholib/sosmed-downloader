@@ -94,6 +94,19 @@
     return cleaned || fallback;
   }
 
+  function tvidFallbackRequest(value) {
+    const mediaUrl = asHttpUrl(value);
+    if (!mediaUrl) return null;
+    const url = new URL(mediaUrl);
+    const match = url.pathname.match(/^\/api\/public-hls\/([A-Za-z0-9_-]+)\/master\.m3u8$/);
+    const sess = url.searchParams.get("sess");
+    if (url.hostname !== "api.tvid.app" || !match || !sess) return null;
+    return {
+      url: `https://api.tvid.app/api/public/${encodeURIComponent(match[1])}/fallback`,
+      body: { failed_url: mediaUrl, sess },
+    };
+  }
+
   function filenameFromUrl(url, kind = "video", index = 0) {
     try {
       const raw = decodeURIComponent(new URL(url).pathname.split("/").pop() || "");
@@ -113,6 +126,7 @@
     isPrivateHostname,
     normalizeCandidate,
     safeFilename,
+    tvidFallbackRequest,
   };
 
   global.SaveflowMedia = api;

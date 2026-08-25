@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Saveflow Helper",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Detect media loaded after you interact with a source page and return it to Saveflow.",
   "permissions": [
     "downloads",
@@ -30,6 +30,7 @@
         "shared.js",
         "content.js"
       ],
+      "all_frames": true,
       "run_at": "document_start"
     }
   ]

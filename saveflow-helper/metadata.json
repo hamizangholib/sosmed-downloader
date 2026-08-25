@@ -1,0 +1,6 @@
+{
+  "name": "Saveflow Helper",
+  "description": "Companion app for Saveflow to extract and download media from any website safely on-device.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
