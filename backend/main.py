@@ -15,11 +15,17 @@ browser honours.
 """
 
 import ast
+import ipaddress
+import json
 import mimetypes
 import os
 import re
+import socket
 from http.cookiejar import Cookie
+from html.parser import HTMLParser
+from urllib.error import HTTPError as UrlHTTPError
 from urllib.parse import quote, urlencode, urljoin, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Query
@@ -70,12 +76,75 @@ YDL_OPTS = {
 STREAMING_PROTOCOLS = ("m3u8", "m3u8_native", "http_dash_segments", "mhtml")
 
 IMAGE_EXTS = ("jpg", "jpeg", "png", "webp", "heic", "gif")
+VIDEO_EXTS = ("mp4", "webm", "mov", "m4v", "mkv", "avi", "m3u8")
 
 CHUNK_SIZE = 64 * 1024
+MAX_HTML_BYTES = 2_000_000
 
 
 class ExtractRequest(BaseModel):
     url: str
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ARG002
+        return None
+
+
+class MediaPageParser(HTMLParser):
+    """Collect public video hints without executing page JavaScript."""
+
+    META_VIDEO = {
+        "og:video", "og:video:url", "og:video:secure_url",
+        "twitter:player:stream",
+    }
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.media: list[tuple[str, str | None]] = []
+        self.thumbnail: str | None = None
+        self.title_parts: list[str] = []
+        self.json_ld: list[str] = []
+        self._in_title = False
+        self._json_parts: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        if tag == "title":
+            self._in_title = True
+        elif tag in ("video", "source"):
+            src = values.get("src") or values.get("data-src")
+            if src:
+                self.media.append((src, values.get("type")))
+            if tag == "video" and values.get("poster") and not self.thumbnail:
+                self.thumbnail = values["poster"]
+        elif tag == "meta":
+            key = (values.get("property") or values.get("name") or "").lower()
+            content = values.get("content")
+            if content and key in self.META_VIDEO:
+                self.media.append((content, values.get("type")))
+            elif content and key in ("og:image", "twitter:image") and not self.thumbnail:
+                self.thumbnail = content
+        elif tag == "link":
+            rel = (values.get("rel") or "").lower().split()
+            if "preload" in rel and (values.get("as") or "").lower() == "video":
+                if values.get("href"):
+                    self.media.append((values["href"], values.get("type")))
+        elif tag == "script" and "ld+json" in (values.get("type") or "").lower():
+            self._json_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._in_title:
+            self.title_parts.append(data)
+        if self._json_parts is not None:
+            self._json_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "title":
+            self._in_title = False
+        elif tag == "script" and self._json_parts is not None:
+            self.json_ld.append("".join(self._json_parts))
+            self._json_parts = None
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +154,174 @@ class ExtractRequest(BaseModel):
 def is_x_url(url: str) -> bool:
     host = (urlsplit(url).hostname or "").lower()
     return host in ("x.com", "twitter.com") or host.endswith((".x.com", ".twitter.com"))
+
+
+def ensure_public_url(url: str) -> str:
+    """Reject credentials, unusual ports, and hosts resolving outside public internet."""
+    if len(url) > 4096:
+        raise HTTPException(status_code=400, detail="That URL is too long.")
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise HTTPException(status_code=400, detail="Please enter a valid public http(s) URL.")
+    if parts.username or parts.password:
+        raise HTTPException(status_code=400, detail="URLs containing login credentials are not allowed.")
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="That URL contains an invalid port.") from exc
+    if port not in (None, 80, 443):
+        raise HTTPException(status_code=400, detail="Only standard HTTP and HTTPS ports are allowed.")
+
+    try:
+        addresses = {
+            ipaddress.ip_address(item[4][0].split("%", 1)[0])
+            for item in socket.getaddrinfo(
+                parts.hostname,
+                port or (443 if parts.scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+        }
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="That hostname could not be resolved.") from exc
+    if not addresses or any(not address.is_global for address in addresses):
+        raise HTTPException(
+            status_code=400,
+            detail="Private, local, and reserved network addresses are not allowed.",
+        )
+    return url
+
+
+def fetch_public_html(url: str) -> tuple[str, str]:
+    """Fetch a small HTML page while validating every redirect target."""
+    opener = build_opener(NoRedirect())
+    current = url
+    for _ in range(6):
+        ensure_public_url(current)
+        request = Request(current, headers={
+            "User-Agent": yt_dlp.utils.std_headers["User-Agent"],
+            "Accept": "text/html,application/xhtml+xml",
+        })
+        try:
+            response = opener.open(request, timeout=30)
+        except UrlHTTPError as exc:
+            location = exc.headers.get("Location")
+            status = exc.code
+            exc.close()
+            if status in (301, 302, 303, 307, 308) and location:
+                current = urljoin(current, location)
+                continue
+            raise yt_dlp.utils.DownloadError(
+                f"The public page returned HTTP {status}."
+            ) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise yt_dlp.utils.DownloadError(f"Could not fetch the public page: {exc}") from exc
+
+        try:
+            final_url = response.geturl()
+            ensure_public_url(final_url)
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            if content_type and "html" not in content_type and "xhtml" not in content_type:
+                raise yt_dlp.utils.DownloadError("The URL is not an HTML video page.")
+            body = response.read(MAX_HTML_BYTES + 1)
+            if len(body) > MAX_HTML_BYTES:
+                raise yt_dlp.utils.DownloadError("The page is too large to inspect safely.")
+            charset = response.headers.get_content_charset() or "utf-8"
+            try:
+                page = body.decode(charset, "replace")
+            except LookupError:
+                page = body.decode("utf-8", "replace")
+            return final_url, page
+        finally:
+            response.close()
+
+    raise yt_dlp.utils.DownloadError("The page redirected too many times.")
+
+
+def json_media_urls(value) -> list[str]:
+    found = []
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            found.extend(
+                child for key, child in item.items()
+                if key.lower() == "contenturl" and isinstance(child, str)
+            )
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    return found
+
+
+def parse_public_media(page_url: str, page: str) -> dict:
+    parser = MediaPageParser()
+    parser.feed(page)
+    for payload in parser.json_ld:
+        try:
+            parser.media.extend((url, None) for url in json_media_urls(json.loads(payload)))
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    formats = []
+    seen = set()
+    for raw_url, mime_type in parser.media[:12]:
+        if len(raw_url) > 4096:
+            continue
+        media_url = urljoin(page_url, raw_url.strip())
+        if media_url in seen:
+            continue
+        try:
+            ensure_public_url(media_url)
+        except HTTPException:
+            continue
+
+        mime = (mime_type or "").split(";", 1)[0].lower()
+        ext = (urlsplit(media_url).path.rsplit(".", 1)[-1] or "").lower()
+        if ext not in VIDEO_EXTS:
+            ext = {
+                "video/webm": "webm",
+                "video/quicktime": "mov",
+                "application/vnd.apple.mpegurl": "m3u8",
+                "application/x-mpegurl": "m3u8",
+            }.get(mime, "mp4")
+
+        seen.add(media_url)
+        formats.append({
+            "format_id": f"public-{len(formats) + 1}",
+            "format_note": "HLS" if ext == "m3u8" else ext.upper(),
+            "url": media_url,
+            "ext": ext,
+            "protocol": "m3u8_native" if ext == "m3u8" else urlsplit(media_url).scheme,
+            "vcodec": "unknown",
+            "acodec": "unknown",
+            "http_headers": {"Referer": page_url},
+        })
+
+    if not formats:
+        raise yt_dlp.utils.DownloadError("No public video source was found in that page.")
+
+    thumbnail = urljoin(page_url, parser.thumbnail) if parser.thumbnail else None
+    if thumbnail:
+        try:
+            ensure_public_url(thumbnail)
+        except HTTPException:
+            thumbnail = None
+    title = re.sub(r"\s+", " ", "".join(parser.title_parts)).strip()[:300] or "Untitled media"
+    return {
+        "id": urlsplit(page_url).path.rstrip("/").rsplit("/", 1)[-1] or "public-video",
+        "title": title,
+        "thumbnail": thumbnail,
+        "webpage_url": page_url,
+        "extractor": "generic-public-page",
+        "extractor_key": "PublicPage",
+        "formats": formats,
+    }
+
+
+def extract_public_page(url: str) -> dict:
+    return parse_public_media(*fetch_public_html(url))
 
 
 def is_streamrizz_url(url: str) -> bool:
@@ -113,7 +350,7 @@ def read_page(ydl, url: str, referer: str | None = None) -> str:
     headers = {"Referer": referer} if referer else {}
     response = ydl.urlopen(YdlRequest(url, headers=headers))
     try:
-        return response.read(2_000_000).decode("utf-8", "replace")
+        return response.read(MAX_HTML_BYTES).decode("utf-8", "replace")
     finally:
         response.close()
 
@@ -260,13 +497,20 @@ def safe_filename(title: str | None, ext: str | None) -> str:
 
 def run_extraction(ydl, url: str, *, x_authenticated: bool = False) -> dict:
     """Run yt-dlp on an existing session and map its failures to HTTP errors."""
-    if not re.match(r"^https?://", url, re.IGNORECASE):
-        raise HTTPException(status_code=400, detail="Please enter a valid http(s) URL.")
+    ensure_public_url(url)
 
     try:
-        info = extract_streamrizz(ydl, url) if is_streamrizz_url(url) else ydl.extract_info(
-            url, download=False
-        )
+        if is_streamrizz_url(url):
+            info = extract_streamrizz(ydl, url)
+        else:
+            try:
+                info = ydl.extract_info(url, download=False)
+            except yt_dlp.utils.DownloadError as exc:
+                if "unsupported url" not in str(exc).lower():
+                    raise
+                info = extract_public_page(url)
+    except HTTPException:
+        raise
     except yt_dlp.utils.DownloadError as exc:
         message = str(exc)
         lowered = message.lower()
@@ -360,6 +604,10 @@ def classify(fmt: dict) -> str | None:
         return "video"
     if has_audio:
         return "audio"
+    if ext == "m3u8":
+        return "stream"
+    if ext in VIDEO_EXTS:
+        return "video"
     # Photo posts and TikTok slideshows arrive with no codecs at all. They used
     # to be dropped here, which is why some posts reported "nothing to download".
     if ext in IMAGE_EXTS or (fmt.get("width") and not fmt.get("fps")):
@@ -604,8 +852,8 @@ def download(
 
     Takes the original post URL rather than a CDN link on purpose. Re-resolving
     means the link is always fresh (CDN URLs expire within hours) and it makes
-    this endpoint unusable as an open proxy — it can only ever fetch URLs that
-    yt-dlp itself produced for a supported platform.
+    this endpoint unusable as an open proxy — it only fetches public media URLs
+    produced by an extractor or discovered in a public video page.
 
     The fetch goes through the *same* yt-dlp session that did the extraction.
     That matters: platform CDNs validate the cookies handed out during
@@ -621,6 +869,7 @@ def download(
 
         item = items[index]
         fmt = pick_raw_format(item, format_id)
+        ensure_public_url(fmt["url"])
         filename = safe_filename(item.get("title"), fmt.get("ext"))
 
         headers = {**(info.get("http_headers") or {}), **(fmt.get("http_headers") or {})}
@@ -629,6 +878,16 @@ def download(
         headers.setdefault("Range", "bytes=0-")
 
         upstream = ydl.urlopen(YdlRequest(fmt["url"], headers=headers))
+        try:
+            ensure_public_url(upstream.url)
+            if "text/html" in (upstream.headers.get("Content-Type") or "").lower():
+                raise HTTPException(
+                    status_code=502,
+                    detail="The discovered video source points to another webpage, not a media file.",
+                )
+        except HTTPException:
+            upstream.close()
+            raise
     except HTTPException:
         ydl.close()
         raise
@@ -724,6 +983,10 @@ def _self_check() -> None:
     # Bare-url extractors.
     assert build_formats({"url": "z", "ext": "jpg"})[0]["kind"] == "image"
     assert build_formats({}) == []
+    direct_file = build_formats({
+        "formats": [{"format_id": "mp4", "url": "z", "ext": "mp4", "protocol": "https"}]
+    })
+    assert direct_file[0]["kind"] == "video"
 
     # Format selection for the download endpoint.
     assert pick_raw_format(video_info, "v3")["url"] == "c"
@@ -760,6 +1023,31 @@ def _self_check() -> None:
         r"const playerPath = 'https://streamrizz.com/stream.php?bucket=x\u0026id=y';",
         "playerPath",
     ) == "https://streamrizz.com/stream.php?bucket=x&id=y"
+
+    sample_page = """
+        <title>Sample clip</title>
+        <video poster="/poster.jpg"><source src="/video.mp4" type="video/mp4"></video>
+        <meta property="og:video" content="https://cdn.example/video.webm">
+        <script type="application/ld+json">
+          {"@type":"VideoObject","contentUrl":"https://cdn.example/master.m3u8"}
+        </script>
+    """
+    parser = MediaPageParser()
+    parser.feed(sample_page)
+    assert parser.title_parts == ["Sample clip"]
+    assert parser.thumbnail == "/poster.jpg"
+    assert parser.media == [
+        ("/video.mp4", "video/mp4"),
+        ("https://cdn.example/video.webm", None),
+    ]
+    assert json_media_urls(json.loads(parser.json_ld[0])) == [
+        "https://cdn.example/master.m3u8"
+    ]
+    try:
+        ensure_public_url("http://127.0.0.1/video.mp4")
+        raise AssertionError("loopback URLs must be rejected")
+    except HTTPException as exc:
+        assert exc.status_code == 400
     assert normalize_cookie_value(' "auth_token=test-auth" ', "auth_token") == "test-auth"
     assert normalize_cookie_value("test-csrf", "ct0") == "test-csrf"
 
