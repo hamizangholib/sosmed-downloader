@@ -20,7 +20,9 @@
    For local development against `uvicorn main:app --port 7860`, use:
        const API_BASE_URL = "http://127.0.0.1:7860";
    ------------------------------------------------------------------------- */
-const API_BASE_URL = "https://saveflow-ten.vercel.app/";
+const API_BASE_URL = ["localhost", "127.0.0.1"].includes(location.hostname)
+  ? "http://127.0.0.1:8765"
+  : "https://saveflow-ten.vercel.app/";
 
 // A trailing slash here would produce `...app//api/extract`, which is a
 // different route and 404s. Strip it once so either spelling works.
@@ -121,37 +123,45 @@ errorClose.addEventListener("click", clearError);
 
 // ---- Rendering -------------------------------------------------------------
 
-/** Build one result card. `index` is only used to label carousel slides. */
-function renderCard(item, platform, index, total, sourceUrl) {
+function downloadUrl(sourceUrl, item, format) {
+  return `${API_ROOT}/api/download` +
+    `?url=${encodeURIComponent(sourceUrl)}` +
+    `&index=${encodeURIComponent(item.index ?? 0)}` +
+    `&format_id=${encodeURIComponent(format?.format_id || "")}`;
+}
+
+/** Build one result card using only the formats from the active media tab. */
+function renderCard(item, formats, platform, index, total, sourceUrl) {
   const card = document.createElement("article");
   card.className = "result-card";
 
   const duration = formatDuration(item.duration);
   const slideLabel = total > 1 ? `<span class="tag tag-muted">Item ${index + 1} of ${total}</span>` : "";
-  const thumbnailUrl = item.thumbnail_proxy
-    ? `${API_ROOT}/api/thumbnail?url=${encodeURIComponent(sourceUrl)}&index=${encodeURIComponent(item.index ?? 0)}`
-    : item.thumbnail;
+  const proxiedThumbnail = `${API_ROOT}/api/thumbnail?url=${encodeURIComponent(sourceUrl)}&index=${encodeURIComponent(item.index ?? 0)}`;
+  const thumbnailUrl = item.thumbnail_proxy ? proxiedThumbnail : item.thumbnail;
+  const previewFormat = formats.find((fmt) => fmt.kind === "image") ||
+    formats.find((fmt) => fmt.kind === "video");
 
   const thumb = thumbnailUrl
     ? `<div class="result-thumb">
          <img src="${escapeHtml(thumbnailUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer"
-              onerror="this.parentElement.classList.add('is-empty'); this.remove();" />
+              data-fallback-thumbnail="${escapeHtml(item.thumbnail_proxy ? "" : proxiedThumbnail)}" />
          ${duration ? `<span class="result-duration">${duration}</span>` : ""}
        </div>`
+    : previewFormat
+      ? `<div class="result-thumb">
+           ${previewFormat.kind === "image"
+             ? `<img src="${escapeHtml(downloadUrl(sourceUrl, item, previewFormat))}" alt="" loading="lazy" />`
+             : `<video src="${escapeHtml(downloadUrl(sourceUrl, item, previewFormat))}" muted preload="metadata" playsinline></video>`}
+           ${duration ? `<span class="result-duration">${duration}</span>` : ""}
+         </div>`
     : `<div class="result-thumb is-empty">No preview</div>`;
 
-  const formats = item.formats.length
-    ? item.formats.map((fmt, i) => {
+  const formatButtons = formats.length
+    ? formats.map((fmt, i) => {
       const size = fmt.filesize ? `<small>${escapeHtml(fmt.filesize)}</small>` : "";
       const icon = { audio: "♪", image: "▣", stream: "≋" }[fmt.kind] || "↓";
-      // Point at our own endpoint rather than the CDN link. It re-resolves the
-      // post (CDN URLs expire), replays the headers the CDN demands, and sends
-      // Content-Disposition: attachment so the browser saves instead of playing.
-      const href =
-        `${API_ROOT}/api/download` +
-        `?url=${encodeURIComponent(sourceUrl)}` +
-        `&index=${encodeURIComponent(item.index ?? 0)}` +
-        `&format_id=${encodeURIComponent(fmt.format_id || "")}`;
+      const href = downloadUrl(sourceUrl, item, fmt);
       return `<a class="format-btn ${i === 0 ? "is-primary" : ""}"
                  href="${escapeHtml(href)}"
                  download="${escapeHtml(toFilename(item.title, fmt.ext))}">
@@ -170,21 +180,108 @@ function renderCard(item, platform, index, total, sourceUrl) {
       </div>
       <h3 class="result-title">${escapeHtml(item.title)}</h3>
       ${item.uploader ? `<p class="result-uploader">by ${escapeHtml(item.uploader)}</p>` : ""}
-      <div class="format-list">${formats}</div>
+      <div class="format-list">${formatButtons}</div>
     </div>`;
+
+  const image = card.querySelector("img");
+  image?.addEventListener("error", () => {
+    const fallback = image.dataset.fallbackThumbnail;
+    if (fallback) {
+      delete image.dataset.fallbackThumbnail;
+      image.src = fallback;
+      return;
+    }
+    image.parentElement.classList.add("is-empty");
+    image.remove();
+  });
+  const video = card.querySelector("video");
+  video?.addEventListener("error", () => {
+    video.parentElement.classList.add("is-empty");
+    video.remove();
+  });
 
   return card;
 }
 
+function renderFolders(data) {
+  const section = document.createElement("section");
+  section.className = "folder-panel";
+  const parent = data.parent_url
+    ? `<button type="button" class="folder-btn folder-back" data-folder-url="${escapeHtml(data.parent_url)}">
+         <span aria-hidden="true">←</span><span>Back</span>
+       </button>`
+    : "";
+  const folders = (data.folders || []).map((folder) => `
+    <button type="button" class="folder-btn" data-folder-url="${escapeHtml(folder.url)}">
+      <span class="folder-icon" aria-hidden="true">▰</span>
+      <span>${escapeHtml(folder.title)}</span>
+    </button>`).join("");
+  section.innerHTML = `
+    <div class="folder-heading">
+      <span class="tag">Folder</span>
+      <h3>${escapeHtml(data.title || "Media folder")}</h3>
+    </div>
+    <div class="folder-grid">${parent}${folders}</div>`;
+  return section;
+}
+
+function renderMedia(data, sourceUrl) {
+  const items = data.items || [];
+  const groups = [
+    {
+      key: "video",
+      label: "Video",
+      entries: items.map((item) => ({
+        item,
+        formats: (item.formats || []).filter((fmt) => fmt.kind !== "image"),
+      })).filter(({ item, formats }) => formats.length || (!(item.formats || []).length && item.thumbnail)),
+    },
+    {
+      key: "photo",
+      label: "Photo",
+      entries: items.map((item) => ({
+        item,
+        formats: (item.formats || []).filter((fmt) => fmt.kind === "image"),
+      })).filter(({ formats }) => formats.length),
+    },
+  ].filter((group) => group.entries.length);
+
+  if (!groups.length) return null;
+  const section = document.createElement("section");
+  section.className = "media-results";
+  const tabs = document.createElement("div");
+  tabs.className = "media-tabs";
+  tabs.setAttribute("role", "tablist");
+  groups.forEach((group, groupIndex) => {
+    const active = groupIndex === 0;
+    tabs.insertAdjacentHTML("beforeend", `
+      <button type="button" class="media-tab ${active ? "is-active" : ""}"
+              role="tab" aria-selected="${active}" data-media-tab="${group.key}">
+        ${group.label} <span>${group.entries.length}</span>
+      </button>`);
+    const pane = document.createElement("div");
+    pane.className = "media-pane";
+    pane.dataset.mediaPane = group.key;
+    pane.hidden = !active;
+    group.entries.forEach(({ item, formats }, index) => {
+      pane.appendChild(renderCard(item, formats, data.platform, index, group.entries.length, sourceUrl));
+    });
+    section.appendChild(pane);
+  });
+  section.prepend(tabs);
+  return section;
+}
+
 function renderResults(data, requestedUrl) {
   results.innerHTML = "";
-  const items = data.items || [];
   const sourceUrl = data.source_url || requestedUrl;
-  items.forEach((item, i) => {
-    results.appendChild(renderCard(item, data.platform, i, items.length, sourceUrl));
-  });
-  results.hidden = items.length === 0;
-  if (items.length) {
+  if ((data.folders || []).length || data.parent_url) {
+    results.appendChild(renderFolders(data));
+  }
+  const media = renderMedia(data, sourceUrl);
+  if (media) results.appendChild(media);
+  results.hidden = !results.children.length;
+  if (results.children.length) {
     results.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
 }
@@ -193,7 +290,27 @@ function renderResults(data, requestedUrl) {
 // browser sits silent for a few seconds. Acknowledge the click so it does not
 // look ignored. There is no completion event for a plain navigation download,
 // so the label simply reverts on a timer.
-results.addEventListener("click", (event) => {
+results.addEventListener("click", async (event) => {
+  const tab = event.target.closest(".media-tab");
+  if (tab) {
+    const key = tab.dataset.mediaTab;
+    results.querySelectorAll(".media-tab").forEach((button) => {
+      const active = button === tab;
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-selected", String(active));
+    });
+    results.querySelectorAll(".media-pane").forEach((pane) => {
+      pane.hidden = pane.dataset.mediaPane !== key;
+    });
+    return;
+  }
+
+  const folder = event.target.closest(".folder-btn");
+  if (folder) {
+    await loadMedia(folder.dataset.folderUrl);
+    return;
+  }
+
   const btn = event.target.closest(".format-btn");
   if (!btn || btn.dataset.busy) return;
   const original = btn.innerHTML;
@@ -205,13 +322,35 @@ results.addEventListener("click", (event) => {
   }, 6000);
 });
 
-// ---- Submit ----------------------------------------------------------------
-form.addEventListener("submit", async (event) => {
-  event.preventDefault();
+async function loadMedia(url) {
   clearError();
   results.hidden = true;
   results.innerHTML = "";
+  setLoading(true);
+  try {
+    const response = await fetch(`${API_ROOT}/api/extract`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new Error(payload?.detail || `Request failed with status ${response.status}.`);
+    }
+    renderResults(payload, url);
+  } catch (err) {
+    const message = err instanceof TypeError
+      ? "Could not reach the Saveflow API. Check that the backend is running and API_BASE_URL is correct."
+      : err.message;
+    showError(message);
+  } finally {
+    setLoading(false);
+  }
+}
 
+// ---- Submit ----------------------------------------------------------------
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
   const url = urlInput.value.trim();
 
   if (!url) {
@@ -228,33 +367,7 @@ form.addEventListener("submit", async (event) => {
     return;
   }
 
-  setLoading(true);
-
-  try {
-    const response = await fetch(`${API_ROOT}/api/extract`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url }),
-    });
-
-    // FastAPI reports failures as {"detail": "..."} — surface that text as-is.
-    const payload = await response.json().catch(() => null);
-
-    if (!response.ok) {
-      throw new Error(payload?.detail || `Request failed with status ${response.status}.`);
-    }
-
-    renderResults(payload, url);
-  } catch (err) {
-    // A network-level failure has no response body; name the likely cause.
-    const message =
-      err instanceof TypeError
-        ? "Could not reach the Saveflow API. Check that the backend is running and API_BASE_URL is correct."
-        : err.message;
-    showError(message);
-  } finally {
-    setLoading(false);
-  }
+  await loadMedia(url);
 });
 
 // ---- Chrome: sticky header shadow + mobile nav -----------------------------

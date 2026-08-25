@@ -21,6 +21,7 @@ import mimetypes
 import os
 import re
 import socket
+import time
 from http.cookiejar import Cookie
 from html.parser import HTMLParser
 from urllib.error import HTTPError as UrlHTTPError
@@ -126,6 +127,11 @@ class MediaPageParser(HTMLParser):
                 self.media.append((src, values.get("type")))
             if tag == "video" and values.get("poster") and not self.thumbnail:
                 self.thumbnail = values["poster"]
+        elif tag == "img" and not self.thumbnail:
+            classes = set((values.get("class") or "").lower().split())
+            alt = (values.get("alt") or "").lower()
+            if "thumbnail" in classes or alt == "thumbnail":
+                self.thumbnail = values.get("src") or values.get("data-src")
         elif tag == "meta":
             key = (values.get("property") or values.get("name") or "").lower()
             content = values.get("content")
@@ -162,9 +168,14 @@ class StreamrizzFolderParser(HTMLParser):
         super().__init__()
         self.title_parts: list[str] = []
         self.entries: list[dict] = []
+        self.folders: list[dict] = []
+        self.parent_url: str | None = None
         self._in_title = False
         self._in_name = False
+        self._in_folder = False
         self._name_parts: list[str] = []
+        self._folder_parts: list[str] = []
+        self._folder: dict | None = None
         self._entry: dict | None = None
 
     def handle_starttag(self, tag: str, attrs) -> None:
@@ -172,6 +183,12 @@ class StreamrizzFolderParser(HTMLParser):
         classes = set((values.get("class") or "").split())
         if tag == "title":
             self._in_title = True
+        elif tag == "a" and "back-btn" in classes and values.get("href"):
+            self.parent_url = values["href"]
+        elif tag == "a" and "folder-chip" in classes and values.get("href"):
+            self._in_folder = True
+            self._folder_parts = []
+            self._folder = {"url": values["href"]}
         elif tag == "article" and "drive-file-card" in classes:
             self._entry = {}
         elif self._entry is not None:
@@ -190,6 +207,8 @@ class StreamrizzFolderParser(HTMLParser):
             self.title_parts.append(data)
         if self._in_name:
             self._name_parts.append(data)
+        if self._in_folder:
+            self._folder_parts.append(data)
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "title":
@@ -198,6 +217,13 @@ class StreamrizzFolderParser(HTMLParser):
             self._in_name = False
             if self._entry is not None and not self._entry.get("title"):
                 self._entry["title"] = "".join(self._name_parts).strip()
+        elif tag == "a" and self._in_folder:
+            self._in_folder = False
+            if self._folder is not None:
+                self._folder["title"] = "".join(self._folder_parts).strip()
+                if self._folder["title"]:
+                    self.folders.append(self._folder)
+            self._folder = None
         elif tag == "article" and self._entry is not None:
             if self._entry.get("url"):
                 self.entries.append(self._entry)
@@ -385,7 +411,7 @@ def is_streamrizz_url(url: str) -> bool:
     parts = urlsplit(url)
     return (
         (parts.hostname or "").lower() in ("streamrizz.com", "www.streamrizz.com")
-        and re.fullmatch(r"/d/[A-Za-z0-9_-]+/?", parts.path) is not None
+        and re.fullmatch(r"/[de]/[A-Za-z0-9_-]+/?", parts.path) is not None
     )
 
 
@@ -412,24 +438,77 @@ def videeyss_id(url: str) -> str | None:
     return match.group(1) if match else None
 
 
-def extract_videeyss(ydl, url: str) -> dict:
-    """Resolve the MP4 that Videeyss inserts only after its Play button is clicked."""
-    clip_id = videeyss_id(url)
-    if not clip_id:
-        raise yt_dlp.utils.DownloadError("Invalid Videeyss video URL.")
+def aceimg_id(url: str) -> str | None:
+    """Return the clip id shared by Aceimg and Slicdrve pages."""
+    parts = urlsplit(url)
+    if (parts.hostname or "").lower() not in (
+        "aceimg.ink", "www.aceimg.ink", "slicdrve.ink", "www.slicdrve.ink",
+    ):
+        return None
+    match = re.fullmatch(r"/([A-Za-z0-9_-]+)/?", parts.path)
+    return match.group(1) if match else None
 
-    media_url = f"https://cdn2.videy.co/{clip_id}.mp4"
+
+def direct_image_ext(url: str) -> str | None:
+    ext = (urlsplit(url).path.rsplit(".", 1)[-1] or "").lower()
+    return ext if ext in IMAGE_EXTS else None
+
+
+def extract_direct_image(ydl, url: str) -> dict:
+    """Validate and expose a public image URL as a downloadable media item."""
+    ext = direct_image_ext(url)
+    if not ext:
+        raise yt_dlp.utils.DownloadError("Invalid public image URL.")
+    ensure_public_url(url)
+    try:
+        response = ydl.urlopen(YdlRequest(url, headers={"Range": "bytes=0-0"}))
+        try:
+            ensure_public_url(response.url)
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            if not content_type.startswith("image/"):
+                raise yt_dlp.utils.DownloadError("That URL did not return an image file.")
+            content_range = response.headers.get("Content-Range") or ""
+            size_match = re.search(r"/(\d+)$", content_range)
+            filesize = int(size_match.group(1)) if size_match else None
+        finally:
+            response.close()
+    except (HTTPException, yt_dlp.utils.DownloadError):
+        raise
+    except Exception as exc:
+        raise yt_dlp.utils.DownloadError(f"Could not resolve public image: {exc}") from exc
+    filename = urlsplit(url).path.rstrip("/").rsplit("/", 1)[-1]
+    return {
+        "id": filename.rsplit(".", 1)[0],
+        "title": filename,
+        "thumbnail": url,
+        "webpage_url": url,
+        "extractor": "public-image",
+        "extractor_key": "PublicImage",
+        "url": url,
+        "ext": ext,
+        "filesize": filesize,
+    }
+
+
+def extract_direct_mp4(
+    ydl,
+    page_url: str,
+    clip_id: str,
+    media_url: str,
+    extractor_key: str,
+) -> dict:
+    """Probe a predictable public MP4 and return normal yt-dlp-shaped metadata."""
     ensure_public_url(media_url)
     try:
         response = ydl.urlopen(YdlRequest(media_url, headers={
-            "Referer": url,
+            "Referer": page_url,
             "Range": "bytes=0-0",
         }))
         try:
             ensure_public_url(response.url)
             content_type = (response.headers.get("Content-Type") or "").lower()
             if not content_type.startswith("video/"):
-                raise yt_dlp.utils.DownloadError("Videeyss did not return a video file.")
+                raise yt_dlp.utils.DownloadError(f"{extractor_key} did not return a video file.")
             content_range = response.headers.get("Content-Range") or ""
             size_match = re.search(r"/(\d+)$", content_range)
             filesize = int(size_match.group(1)) if size_match else None
@@ -440,16 +519,16 @@ def extract_videeyss(ydl, url: str) -> dict:
     except yt_dlp.utils.DownloadError:
         raise
     except Exception as exc:
-        raise yt_dlp.utils.DownloadError(f"Could not resolve Videeyss media: {exc}") from exc
+        raise yt_dlp.utils.DownloadError(f"Could not resolve {extractor_key} media: {exc}") from exc
 
     return {
         "id": clip_id,
         "title": clip_id,
-        "webpage_url": url,
-        "extractor": "videeyss",
-        "extractor_key": "Videeyss",
+        "webpage_url": page_url,
+        "extractor": extractor_key.lower(),
+        "extractor_key": extractor_key,
         "formats": [{
-            "format_id": "videeyss-mp4",
+            "format_id": f"{extractor_key.lower()}-mp4",
             "format_note": "MP4",
             "url": media_url,
             "ext": "mp4",
@@ -457,9 +536,29 @@ def extract_videeyss(ydl, url: str) -> dict:
             "vcodec": "unknown",
             "acodec": "unknown",
             "filesize": filesize,
-            "http_headers": {"Referer": url},
+            "http_headers": {"Referer": page_url},
         }],
     }
+
+
+def extract_videeyss(ydl, url: str) -> dict:
+    """Resolve the MP4 that Videeyss inserts only after its Play button is clicked."""
+    clip_id = videeyss_id(url)
+    if not clip_id:
+        raise yt_dlp.utils.DownloadError("Invalid Videeyss video URL.")
+    return extract_direct_mp4(
+        ydl, url, clip_id, f"https://cdn2.videy.co/{clip_id}.mp4", "Videeyss"
+    )
+
+
+def extract_aceimg(ydl, url: str) -> dict:
+    """Resolve the MP4 that Aceimg and Slicdrve construct from the page path."""
+    clip_id = aceimg_id(url)
+    if not clip_id:
+        raise yt_dlp.utils.DownloadError("Invalid Aceimg/Slicdrve video URL.")
+    return extract_direct_mp4(
+        ydl, url, clip_id, f"https://cdn2.aceimg.com/{clip_id}.mp4", "Aceimg"
+    )
 
 
 def js_string(page: str, name: str) -> str:
@@ -485,7 +584,19 @@ def read_page(
     request_headers = {**(headers or {})}
     if referer:
         request_headers["Referer"] = referer
-    response = ydl.urlopen(YdlRequest(url, headers=request_headers))
+    response = None
+    for attempt in range(3):
+        try:
+            response = ydl.urlopen(YdlRequest(url, headers=request_headers))
+            break
+        except YdlHTTPError as exc:
+            if exc.status not in (429, 500, 502, 503, 504) or attempt == 2:
+                raise yt_dlp.utils.DownloadError(
+                    f"The media page returned HTTP {exc.status}."
+                ) from exc
+            time.sleep(0.2 * (attempt + 1))
+    if response is None:
+        raise yt_dlp.utils.DownloadError("Could not fetch the media page.")
     try:
         return response.read(MAX_HTML_BYTES).decode("utf-8", "replace")
     finally:
@@ -521,6 +632,7 @@ def extract_streamrizz_folder(ydl, url: str) -> dict:
             "id": video_id,
             "title": raw.get("title") or video_id,
             "thumbnail": thumbnail,
+            "_thumbnail_proxy": bool(thumbnail),
             "webpage_url": video_page,
             "_streamrizz_url": video_page,
             "_streamrizz_format_id": format_id,
@@ -535,8 +647,23 @@ def extract_streamrizz_folder(ydl, url: str) -> dict:
             }],
         })
 
-    if not entries:
-        raise yt_dlp.utils.DownloadError("No videos were found in that folder.")
+    folders = []
+    for raw in parser.folders[:100]:
+        child_url = urljoin(folder_url, raw["url"])
+        if not streamrizz_folder_id(child_url):
+            continue
+        try:
+            ensure_public_url(child_url)
+        except HTTPException:
+            continue
+        folders.append({"title": raw["title"], "url": child_url})
+
+    parent_url = urljoin(folder_url, parser.parent_url) if parser.parent_url else None
+    if parent_url and not streamrizz_folder_id(parent_url):
+        parent_url = None
+
+    if not entries and not folders:
+        raise yt_dlp.utils.DownloadError("No media or subfolders were found in that folder.")
     title = re.sub(r"^\s*📂\s*", "", "".join(parser.title_parts)).strip()
     return {
         "id": folder_id,
@@ -545,6 +672,8 @@ def extract_streamrizz_folder(ydl, url: str) -> dict:
         "extractor": "streamrizz:folder",
         "extractor_key": "StreamrizzFolder",
         "entries": entries,
+        "_folders": folders,
+        "_parent_url": parent_url,
     }
 
 
@@ -552,6 +681,8 @@ def extract_streamrizz(ydl, url: str) -> dict:
     """Resolve Streamrizz's short-lived player URL, then let yt-dlp parse HTML5 media."""
     try:
         page = read_page(ydl, url)
+        outer = MediaPageParser()
+        outer.feed(page)
         iframe_url = urljoin(url, "/ip129jk?" + urlencode({
             "id": js_string(page, "iframeId"),
             "t": js_string(page, "embedToken"),
@@ -583,6 +714,11 @@ def extract_streamrizz(ydl, url: str) -> dict:
         "extractor_key": "Streamrizz",
         "webpage_url": url,
     })
+    if outer.thumbnail:
+        thumbnail = urljoin(url, outer.thumbnail)
+        ensure_public_url(thumbnail)
+        info["thumbnail"] = thumbnail
+        info["_thumbnail_proxy"] = True
     return info
 
 
@@ -861,7 +997,11 @@ def safe_filename(title: str | None, ext: str | None) -> str:
     """Build a filesystem-safe download name. Never returns an empty stem."""
     base = re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", str(title or "")).strip()
     base = re.sub(r"\s+", " ", base)[:80].strip() or "saveflow"
-    return f"{base}.{ext or 'mp4'}"
+    suffix = (ext or "mp4").lower()
+    base = re.sub(
+        rf"\.{re.escape(suffix)}(?=(?: \(\d+\))?$)", "", base, flags=re.IGNORECASE
+    ).rstrip()
+    return f"{base or 'saveflow'}.{suffix}"
 
 
 def run_extraction(
@@ -875,12 +1015,16 @@ def run_extraction(
     ensure_public_url(url)
 
     try:
-        if streamrizz_folder_id(url):
+        if direct_image_ext(url):
+            info = extract_direct_image(ydl, url)
+        elif streamrizz_folder_id(url):
             info = extract_streamrizz_folder(ydl, url)
         elif is_streamrizz_url(url):
             info = extract_streamrizz(ydl, url)
         elif videeyss_id(url):
             info = extract_videeyss(ydl, url)
+        elif aceimg_id(url):
+            info = extract_aceimg(ydl, url)
         else:
             try:
                 info = ydl.extract_info(url, download=False)
@@ -1186,15 +1330,22 @@ def build_formats(info: dict) -> list[dict]:
 
 def build_item(info: dict, index: int) -> dict:
     """Shape one media entry (a single post, or one slide of a carousel)."""
+    formats = build_formats(info)
+    thumbnail = info.get("thumbnail")
+    if not thumbnail:
+        thumbnail = next(
+            (fmt["url"] for fmt in formats if fmt.get("kind") == "image"),
+            None,
+        )
     return {
         "index": index,
         "title": info.get("title") or info.get("description") or "Untitled media",
-        "thumbnail": info.get("thumbnail"),
+        "thumbnail": thumbnail,
         "thumbnail_proxy": bool(info.get("_thumbnail_proxy")),
         "duration": info.get("duration"),
         "uploader": info.get("uploader") or info.get("channel") or info.get("uploader_id"),
         "warning": info.get("_media_warning"),
-        "formats": build_formats(info),
+        "formats": formats,
     }
 
 
@@ -1298,8 +1449,9 @@ def extract(payload: ExtractRequest):
 
     items = [build_item(entry, i) for i, entry in enumerate(entries_of(info))]
     items = [item for item in items if item["formats"] or item["thumbnail"]]
+    folders = info.get("_folders") or []
 
-    if not items:
+    if not items and not folders:
         raise HTTPException(
             status_code=400,
             detail="No downloadable media or preview image was found at that link.",
@@ -1310,10 +1462,12 @@ def extract(payload: ExtractRequest):
         "source_url": info.get("webpage_url") or url,
         # Top-level fields mirror the first item so simple clients can ignore
         # `items` entirely.
-        "title": items[0]["title"],
-        "thumbnail": items[0]["thumbnail"],
-        "duration": items[0]["duration"],
+        "title": info.get("title") or (items[0]["title"] if items else "Media folder"),
+        "thumbnail": items[0]["thumbnail"] if items else None,
+        "duration": items[0]["duration"] if items else None,
         "items": items,
+        "folders": folders,
+        "parent_url": info.get("_parent_url"),
     }
 
 
@@ -1542,6 +1696,8 @@ def _self_check() -> None:
     # Filenames must be safe and never empty, and headers must not be injectable.
     assert safe_filename('a/b:c*d"e', "mp4") == "a b c d e.mp4"
     assert safe_filename("   ", None) == "saveflow.mp4"
+    assert safe_filename("already.jpg", "jpg") == "already.jpg"
+    assert safe_filename("already.mp4 (1)", "mp4") == "already (1).mp4"
     assert safe_filename("x\r\nSet-Cookie: y", "mp4") == "x Set-Cookie y.mp4"
     header = content_disposition(safe_filename("Kucing 🐈 lucu", "mp4"))
     assert "\r" not in header and "\n" not in header
@@ -1565,6 +1721,7 @@ def _self_check() -> None:
         "https://example.com/1", Exception("No video could be found in this tweet")
     )
     assert is_streamrizz_url("https://streamrizz.com/d/abc_123-x")
+    assert is_streamrizz_url("https://streamrizz.com/e/abc_123-x")
     assert not is_streamrizz_url("https://streamrizz.example/d/abc_123-x")
     assert streamrizz_folder_id("https://tribunvideo.com/f/abc_123-x") == "abc_123-x"
     assert streamrizz_folder_id("https://streamrizz.com/f/abc_123-x") == "abc_123-x"
@@ -1573,6 +1730,11 @@ def _self_check() -> None:
     assert videeyss_id("https://www.videeyss.shop/abc_123-x/") == "abc_123-x"
     assert videeyss_id("https://videeyss.shop/a/b") is None
     assert videeyss_id("https://videeyss.example/DFNXJw7g1") is None
+    assert aceimg_id("https://slicdrve.ink/i71UvqVF6") == "i71UvqVF6"
+    assert aceimg_id("https://aceimg.ink/2ZSqnueRR") == "2ZSqnueRR"
+    assert aceimg_id("https://aceimg.example/2ZSqnueRR") is None
+    assert direct_image_ext("https://cdn.example/photo.JPG?size=large") == "jpg"
+    assert direct_image_ext("https://cdn.example/video.mp4") is None
     assert js_string(
         r"const playerPath = 'https://streamrizz.com/stream.php?bucket=x\u0026id=y';",
         "playerPath",
@@ -1581,6 +1743,8 @@ def _self_check() -> None:
     folder_parser = StreamrizzFolderParser()
     folder_parser.feed('''
         <title>📂 Sample folder</title>
+        <a class="back-btn" href="/f/parent">Back</a>
+        <a class="folder-chip" href="/f/child">Child folder</a>
         <article class="drive-file-card">
           <a class="thumb-link" href="/d/clip1"><img src="https://img.example/1.jpg"></a>
           <a class="file-name" title="First clip.mp4" href="/d/clip1">First clip.mp4</a>
@@ -1591,6 +1755,8 @@ def _self_check() -> None:
         "thumbnail": "https://img.example/1.jpg",
         "title": "First clip.mp4",
     }]
+    assert folder_parser.folders == [{"url": "/f/child", "title": "Child folder"}]
+    assert folder_parser.parent_url == "/f/parent"
     assert preview_reader_target(
         "https://www.pornhub.com/view_video.php?viewkey=abc123"
     ) == ("PornHub", "http://www.pornhub.com/embed/abc123")
