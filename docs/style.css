@@ -35,6 +35,8 @@
 *::before,
 *::after { box-sizing: border-box; }
 
+[hidden] { display: none !important; }
+
 html { scroll-behavior: smooth; scroll-padding-top: calc(var(--header-h) + 16px); }
 
 body {

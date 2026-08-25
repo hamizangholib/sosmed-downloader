@@ -467,6 +467,18 @@ def aceimg_id(url: str) -> str | None:
     return match.group(1) if match else None
 
 
+def aceimg_cdn_page(url: str) -> str | None:
+    """Map an AceImg CDN file back to its interactive public player page."""
+    parts = urlsplit(url)
+    if (parts.hostname or "").lower() not in (
+        "cdn.aceimg.com", "www.cdn.aceimg.com",
+        "cdn2.aceimg.com", "www.cdn2.aceimg.com",
+    ):
+        return None
+    match = re.fullmatch(r"/([A-Za-z0-9_-]+)\.mp4", parts.path, re.IGNORECASE)
+    return f"https://aceimg.ink/{match.group(1)}" if match else None
+
+
 def vid3y_media(url: str) -> tuple[str, str] | None:
     """Resolve Vid3y's click-through page to its predictable media CDN URL."""
     parts = urlsplit(url)
@@ -1327,8 +1339,13 @@ def run_extraction(
             info = extract_streamrizz(ydl, url)
         elif videeyss_id(url):
             info = extract_videeyss(ydl, url)
+        elif aceimg_page := aceimg_cdn_page(url):
+            info = extract_public_page(aceimg_page)
         elif aceimg_id(url):
-            info = extract_aceimg(ydl, url)
+            try:
+                info = extract_aceimg(ydl, url)
+            except yt_dlp.utils.DownloadError:
+                info = extract_public_page(url)
         elif vid3y_media(url):
             info = extract_vid3y(ydl, url)
         elif is_instagram_url(url):
@@ -2058,6 +2075,10 @@ def _self_check() -> None:
     assert aceimg_id("https://slicdrve.ink/i71UvqVF6") == "i71UvqVF6"
     assert aceimg_id("https://aceimg.ink/2ZSqnueRR") == "2ZSqnueRR"
     assert aceimg_id("https://aceimg.example/2ZSqnueRR") is None
+    assert aceimg_cdn_page("https://cdn2.aceimg.com/Vsbx6xpay.mp4") == (
+        "https://aceimg.ink/Vsbx6xpay"
+    )
+    assert aceimg_cdn_page("https://cdn.example/Vsbx6xpay.mp4") is None
     assert direct_image_ext("https://cdn.example/photo.JPG?size=large") == "jpg"
     assert direct_image_ext("https://cdn.example/video.mp4") is None
     assert vid3y_media("https://cdn.vid3y.my.id/2bnwZ5S21") == (
