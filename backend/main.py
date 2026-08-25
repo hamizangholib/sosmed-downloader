@@ -14,11 +14,12 @@ replay those headers and set `Content-Disposition: attachment`, which every
 browser honours.
 """
 
+import ast
 import mimetypes
 import os
 import re
 from http.cookiejar import Cookie
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlencode, urljoin, urlsplit
 
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Query
@@ -84,6 +85,75 @@ class ExtractRequest(BaseModel):
 def is_x_url(url: str) -> bool:
     host = (urlsplit(url).hostname or "").lower()
     return host in ("x.com", "twitter.com") or host.endswith((".x.com", ".twitter.com"))
+
+
+def is_streamrizz_url(url: str) -> bool:
+    parts = urlsplit(url)
+    return (
+        (parts.hostname or "").lower() in ("streamrizz.com", "www.streamrizz.com")
+        and re.fullmatch(r"/d/[A-Za-z0-9_-]+/?", parts.path) is not None
+    )
+
+
+def js_string(page: str, name: str) -> str:
+    match = re.search(
+        rf"\b(?:const|let|var)\s+{re.escape(name)}\s*=\s*(['\"])(.*?)\1",
+        page,
+        re.DOTALL,
+    )
+    if not match:
+        raise yt_dlp.utils.DownloadError(f"Streamrizz did not provide {name}.")
+    try:
+        return ast.literal_eval(f"{match.group(1)}{match.group(2)}{match.group(1)}")
+    except (SyntaxError, ValueError) as exc:
+        raise yt_dlp.utils.DownloadError(f"Streamrizz returned an invalid {name}.") from exc
+
+
+def read_page(ydl, url: str, referer: str | None = None) -> str:
+    headers = {"Referer": referer} if referer else {}
+    response = ydl.urlopen(YdlRequest(url, headers=headers))
+    try:
+        return response.read(2_000_000).decode("utf-8", "replace")
+    finally:
+        response.close()
+
+
+def extract_streamrizz(ydl, url: str) -> dict:
+    """Resolve Streamrizz's short-lived player URL, then let yt-dlp parse HTML5 media."""
+    try:
+        page = read_page(ydl, url)
+        iframe_url = urljoin(url, "/ip129jk?" + urlencode({
+            "id": js_string(page, "iframeId"),
+            "t": js_string(page, "embedToken"),
+        }))
+        player_url = js_string(read_page(ydl, iframe_url, url), "playerPath")
+        player = urlsplit(player_url)
+        if player.scheme not in ("http", "https") or player.hostname != "streamrizz.com":
+            raise yt_dlp.utils.DownloadError("Streamrizz returned an invalid player URL.")
+
+        info = ydl.extract_info(player_url, download=False)
+    except yt_dlp.utils.DownloadError:
+        raise
+    except Exception as exc:
+        raise yt_dlp.utils.DownloadError(f"Could not resolve Streamrizz media: {exc}") from exc
+
+    if not info:
+        raise yt_dlp.utils.DownloadError("Streamrizz did not return a video.")
+
+    for fmt in info.get("formats") or [info]:
+        if fmt.get("ext") in (None, "unknown_video"):
+            fmt["ext"] = "mp4"
+        if fmt.get("vcodec") is None:
+            fmt["vcodec"] = "unknown"
+        if fmt.get("acodec") is None:
+            fmt["acodec"] = "unknown"
+
+    info.update({
+        "extractor": "streamrizz",
+        "extractor_key": "Streamrizz",
+        "webpage_url": url,
+    })
+    return info
 
 
 def is_x_auth_gate(url: str, error: Exception) -> bool:
@@ -153,8 +223,9 @@ def add_x_auth_cookies(ydl, auth_token: str | None, ct0: str | None) -> bool:
     return True
 
 
-def make_ydl(*, x_authenticated: bool = False):
-    ydl = yt_dlp.YoutubeDL(YDL_OPTS)
+def make_ydl(*, x_authenticated: bool = False, streamrizz: bool = False):
+    opts = {**YDL_OPTS, **({"nocheckcertificate": True} if streamrizz else {})}
+    ydl = yt_dlp.YoutubeDL(opts)
     if x_authenticated:
         add_x_auth_cookies(ydl, *x_cookie_values())
     return ydl
@@ -193,7 +264,9 @@ def run_extraction(ydl, url: str, *, x_authenticated: bool = False) -> dict:
         raise HTTPException(status_code=400, detail="Please enter a valid http(s) URL.")
 
     try:
-        info = ydl.extract_info(url, download=False)
+        info = extract_streamrizz(ydl, url) if is_streamrizz_url(url) else ydl.extract_info(
+            url, download=False
+        )
     except yt_dlp.utils.DownloadError as exc:
         message = str(exc)
         lowered = message.lower()
@@ -237,7 +310,9 @@ def extract_info(url: str) -> dict:
 
 def extract_with_session(url: str):
     """Extract anonymously, retrying with X cookies only for an explicit auth gate."""
-    ydl = make_ydl()
+    # Streamrizz's current media CDN has an expired certificate. Keep the bypass
+    # scoped to this one integration instead of weakening every platform.
+    ydl = make_ydl(streamrizz=is_streamrizz_url(url))
     try:
         return ydl, run_extraction(ydl, url)
     except HTTPException as exc:
@@ -679,6 +754,12 @@ def _self_check() -> None:
     assert not should_retry_x_auth(
         "https://example.com/1", Exception("No video could be found in this tweet")
     )
+    assert is_streamrizz_url("https://streamrizz.com/d/abc_123-x")
+    assert not is_streamrizz_url("https://streamrizz.example/d/abc_123-x")
+    assert js_string(
+        r"const playerPath = 'https://streamrizz.com/stream.php?bucket=x\u0026id=y';",
+        "playerPath",
+    ) == "https://streamrizz.com/stream.php?bucket=x&id=y"
     assert normalize_cookie_value(' "auth_token=test-auth" ', "auth_token") == "test-auth"
     assert normalize_cookie_value("test-csrf", "ct0") == "test-csrf"
 
